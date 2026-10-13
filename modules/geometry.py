@@ -1,10 +1,14 @@
+"""Hình học: giao điểm line, refine keypoint sân, homography frame -> mini-map."""
+
 import cv2
 import numpy as np
-import config
+
+from config import (
+    REFINE_CROP_HALF, REFINE_WHITE_THRESH, REFINE_MAX_SHIFT, _MINI_DST,
+)
 
 
 def line_intersection(p1, p2, p3, p4):
-
     x1, y1 = p1
     x2, y2 = p2
     x3, y3 = p3
@@ -22,63 +26,49 @@ def line_intersection(p1, p2, p3, p4):
 
 
 def _weighted_avg_line(candidates):
-    """Trung bình có trọng số (theo độ dài) của các line cùng hướng
-    -> ổn định hơn khi có nhiễu, thay vì chỉ chọn 1 line dài nhất."""
+    """Trung bình có trọng số (theo độ dài) của các line cùng hướng."""
 
     total_len = sum(ln for _, ln in candidates)
-    lx1 = sum(l[0] * ln for l, ln in candidates) / total_len
-    ly1 = sum(l[1] * ln for l, ln in candidates) / total_len
-    lx2 = sum(l[2] * ln for l, ln in candidates) / total_len
-    ly2 = sum(l[3] * ln for l, ln in candidates) / total_len
-    return (lx1, ly1, lx2, ly2)
+    return tuple(
+        sum(l[k] * ln for l, ln in candidates) / total_len for k in range(4)
+    )
 
 
-def refine_keypoint_by_lines(
-    frame,
-    pt,
-    crop_half=config.REFINE_CROP_HALF,
-    white_thresh=config.REFINE_WHITE_THRESH,
-    max_shift=config.REFINE_MAX_SHIFT,
-):
+def refine_keypoint_by_lines(frame, pt):
+    """Kéo keypoint dính vào giao điểm của 2 đường kẻ trắng gần nhất."""
+
     h, w = frame.shape[:2]
     x, y = pt
 
-    x0 = max(0, int(x - crop_half))
-    y0 = max(0, int(y - crop_half))
-    x1c = min(w, int(x + crop_half))
-    y1c = min(h, int(y + crop_half))
+    x0 = max(0, int(x - REFINE_CROP_HALF))
+    y0 = max(0, int(y - REFINE_CROP_HALF))
+    x1c = min(w, int(x + REFINE_CROP_HALF))
+    y1c = min(h, int(y + REFINE_CROP_HALF))
 
     crop = frame[y0:y1c, x0:x1c]
 
-    if crop.size == 0:
+    if crop.size == 0:   # keypoint nằm ngoài khung hình
         return pt
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-    # --- Threshold thích nghi: lấy percentile sáng nhất trong vùng crop
-    # thay vì ngưỡng cố định (ánh sáng sân có thể khác nhau giữa các trận)
-    local_thresh = max(white_thresh, np.percentile(gray, 85))
+    # Threshold thích nghi theo percentile sáng nhất trong vùng crop
+    local_thresh = max(REFINE_WHITE_THRESH, np.percentile(gray, 85))
     _, mask = cv2.threshold(gray, local_thresh, 255, cv2.THRESH_BINARY)
-
-    # Đóng khoảng hở nhỏ do nhiễu hạt trên mặt sân (đất nện, cỏ...)
-    kernel = np.ones((3, 3), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
     edges = cv2.Canny(mask, 50, 150)
 
     lines = cv2.HoughLinesP(
-        edges, 1, np.pi / 180,
-        threshold=10, minLineLength=10, maxLineGap=5,
+        edges, 1, np.pi / 180, threshold=10, minLineLength=10, maxLineGap=5,
     )
 
     if lines is None or len(lines) < 2:
         return pt
 
-    lines = np.asarray(lines).reshape(-1, 4)
-
     horiz, vert = [], []
 
-    for l in lines:
+    for l in lines.reshape(-1, 4):
         lx1, ly1, lx2, ly2 = l
         length = np.hypot(lx2 - lx1, ly2 - ly1)
         angle = abs(np.degrees(np.arctan2(ly2 - ly1, lx2 - lx1)))
@@ -94,10 +84,7 @@ def refine_keypoint_by_lines(
     hl = _weighted_avg_line(horiz)
     vl = _weighted_avg_line(vert)
 
-    inter = line_intersection(
-        (hl[0], hl[1]), (hl[2], hl[3]),
-        (vl[0], vl[1]), (vl[2], vl[3]),
-    )
+    inter = line_intersection((hl[0], hl[1]), (hl[2], hl[3]), (vl[0], vl[1]), (vl[2], vl[3]))
 
     if inter is None:
         return pt
@@ -109,9 +96,32 @@ def refine_keypoint_by_lines(
 
     refined = (x0 + ix, y0 + iy)
 
-    # --- Sanity check: nếu điểm refine di chuyển quá xa so với dự đoán
-    # gốc của model, khả năng cao là bắt nhầm line -> giữ nguyên điểm gốc
-    if np.hypot(refined[0] - x, refined[1] - y) > max_shift:
+    # Dịch quá xa so với dự đoán gốc -> khả năng bắt nhầm line, giữ điểm gốc
+    if np.hypot(refined[0] - x, refined[1] - y) > REFINE_MAX_SHIFT:
         return pt
 
     return refined
+
+
+def compute_court_homography(keypoints):
+    """Homography từ 4 góc sân trên frame sang mini-map. Model: 0=TL, 1=TR, 2=BL, 3=BR."""
+
+    src = np.array([
+        keypoints[0][:2],  # top-left
+        keypoints[1][:2],  # top-right
+        keypoints[3][:2],  # bottom-right
+        keypoints[2][:2],  # bottom-left
+    ], dtype=np.float32)
+
+    return cv2.getPerspectiveTransform(src, _MINI_DST)
+
+
+def project_point(H, pt):
+    """Chiếu 1 điểm (x, y) trên frame gốc qua homography H."""
+
+    res = H @ np.array([pt[0], pt[1], 1.0], dtype=np.float32)
+
+    if abs(res[2]) < 1e-6:
+        return None
+
+    return (res[0] / res[2], res[1] / res[2])

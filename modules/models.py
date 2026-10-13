@@ -1,123 +1,94 @@
+"""Load các model: bóng (YOLO), người (YOLO), sân (KeypointRCNN)."""
+
 import os
 
 import torch
 import torchvision
 from ultralytics import YOLO
-from torchvision.models.detection.keypoint_rcnn import KeypointRCNNPredictor
 
-import config
+from config import (
+    DEVICE, NUM_KEYPOINTS,
+    BALL_MODEL_PATH, BALL_MODEL_ENGINE_PATH, PERSON_MODEL_PATH, PERSON_MODEL_ENGINE_PATH,
+    COURT_MODEL_PATH, COURT_MODEL_FP16_PATH,
+    USE_TENSORRT_BALL, USE_TENSORRT_PERSON, USE_FP16_COURT,
+    USE_BALL_LOCAL_ENGINE, BALL_LOCAL_ENGINE_PATH, PERSON_MODEL_FALLBACKS,
+)
 
 
-def build_court_model(num_keypoints: int) -> torch.nn.Module:
-    """Tạo kiến trúc KeypointRCNN với đầu ra num_keypoints (chưa load weight)."""
+def load_court_model(weights_path, use_fp16=False):
+    """KeypointRCNN với NUM_KEYPOINTS đầu ra + load weight."""
 
-    model = torchvision.models.detection.keypointrcnn_resnet50_fpn(weights=None)
-
-    in_features = (
-        model.roi_heads
-        .keypoint_predictor
-        .kps_score_lowres
-        .in_channels
+    model = torchvision.models.detection.keypointrcnn_resnet50_fpn(
+        weights=None, num_keypoints=NUM_KEYPOINTS
     )
 
-    model.roi_heads.keypoint_predictor = KeypointRCNNPredictor(
-        in_features,
-        num_keypoints,
-    )
-
-    return model
-
-
-def load_court_model(weights_path: str, num_keypoints: int, device: torch.device,
-                      use_fp16: bool = False) -> torch.nn.Module:
-    """
-    Load court model. Nếu use_fp16=True, weights_path phải trỏ tới file
-    đã được quantize_court_model.py tạo ra (state_dict FP16) -> model
-    sẽ được chạy ở half precision. Ngược lại load bản FP32 bình thường.
-    """
-
-    model = build_court_model(num_keypoints)
-
-    # Mở file checkpoint
-    checkpoint = torch.load(weights_path, map_location=device)
-
-    # Kiểm tra nếu checkpoint là một dict chứa 'model_state_dict' thì lấy ra, ngược lại dùng trực tiếp
-    if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    else:
-        state_dict = checkpoint
-
-    # Load state_dict vào mô hình
-    model.load_state_dict(state_dict)
-
-    model.to(device)
+    checkpoint = torch.load(weights_path, map_location=DEVICE)
+    model.load_state_dict(checkpoint.get("model_state_dict", checkpoint))
+    model.to(DEVICE)
 
     if use_fp16:
         model.half()
 
-    model.eval()
-
-    return model
+    return model.eval()
 
 
-def _resolve_yolo_weights(pt_path: str, engine_path: str, use_engine: bool, label: str) -> str:
-    """Chọn file .engine (TensorRT INT8) nếu use_engine=True và file đó
-    thực sự tồn tại trên đĩa, ngược lại fallback về .pt gốc + cảnh báo."""
+def _resolve_yolo_weights(pt_path, engine_path, use_engine, label):
+    """Chọn .engine (TensorRT) nếu bật và file tồn tại, ngược lại dùng .pt."""
 
     if use_engine and os.path.exists(engine_path):
-        print(f"[{label}] Dùng bản đã lượng tử hóa (TensorRT INT8): {engine_path}")
+        print(f"[{label}] Dùng bản đã lượng tử hóa (TensorRT): {engine_path}")
         return engine_path
 
-    if use_engine and not os.path.exists(engine_path):
-        print(
-            f"[{label}] CẢNH BÁO: chưa tìm thấy '{engine_path}'. "
-            f"Chạy quantize_yolo_models.py trước để tạo engine. "
-            f"Tạm thời dùng bản gốc FP32: {pt_path}"
-        )
+    if use_engine:
+        print(f"[{label}] CẢNH BÁO: chưa tìm thấy '{engine_path}'. Tạm dùng bản gốc FP32: {pt_path}")
 
     return pt_path
 
 
+def _load_person_model():
+    """Thử PERSON_MODEL_PATH rồi lần lượt các fallback; model đầu tiên load được thì dùng."""
+
+    last_err = None
+
+    for pt in [PERSON_MODEL_PATH, *PERSON_MODEL_FALLBACKS]:
+        try:
+            return YOLO(_resolve_yolo_weights(
+                pt, pt.replace(".pt", ".engine"), USE_TENSORRT_PERSON, "Person model"))
+        except Exception as e:  # noqa: BLE001
+            print(f"[Person model] không load được '{pt}': {e}")
+            last_err = e
+
+    raise last_err
+
+
 def load_all_models():
-    """
-    Load toàn bộ model cần thiết cho pipeline, ưu tiên bản đã lượng tử
-    hóa nếu tồn tại (bật/tắt qua config.USE_TENSORRT_*, config.USE_FP16_COURT).
-    Tự động fallback về bản FP32 gốc nếu chưa chạy script quantize
-    tương ứng, để không bao giờ bị crash vì thiếu file.
+    """Returns: ball_model, person_model, court_model, ball_local_model (có thể None)"""
 
-    Returns:
-        ball_model, person_model, court_model
-    """
+    ball_model = YOLO(_resolve_yolo_weights(
+        BALL_MODEL_PATH, BALL_MODEL_ENGINE_PATH, USE_TENSORRT_BALL, "Ball model"))
+    person_model = _load_person_model()
 
-    ball_weights = _resolve_yolo_weights(
-        config.BALL_MODEL_PATH, config.BALL_MODEL_ENGINE_PATH,
-        config.USE_TENSORRT_BALL, "Ball model",
-    )
-    person_weights = _resolve_yolo_weights(
-        config.PERSON_MODEL_PATH, config.PERSON_MODEL_ENGINE_PATH,
-        config.USE_TENSORRT_PERSON, "Person model",
-    )
+    ball_local_model = None
 
-    ball_model = YOLO(ball_weights)
-    person_model = YOLO(person_weights)
+    if USE_BALL_LOCAL_ENGINE:
+        if os.path.exists(BALL_LOCAL_ENGINE_PATH):
+            print(f"[Ball local] Dùng engine nhỏ cho ROI: {BALL_LOCAL_ENGINE_PATH}")
+            ball_local_model = YOLO(BALL_LOCAL_ENGINE_PATH)
+        else:
+            print(
+                f"[Ball local] CẢNH BÁO: chưa tìm thấy '{BALL_LOCAL_ENGINE_PATH}'. "
+                f"Chạy quantize_ball_local.py để tạo. Tạm dùng chung model global."
+            )
 
-    use_fp16_court = config.USE_FP16_COURT and os.path.exists(config.COURT_MODEL_FP16_PATH)
+    use_fp16_court = USE_FP16_COURT and os.path.exists(COURT_MODEL_FP16_PATH)
 
-    if config.USE_FP16_COURT and not use_fp16_court:
-        print(
-            f"[Court model] CẢNH BÁO: chưa tìm thấy '{config.COURT_MODEL_FP16_PATH}'. "
-            f"Chạy quantize_court_model.py trước. Tạm thời dùng bản gốc FP32."
-        )
-
-    court_weights_path = config.COURT_MODEL_FP16_PATH if use_fp16_court else config.COURT_MODEL_PATH
+    if USE_FP16_COURT and not use_fp16_court:
+        print(f"[Court model] CẢNH BÁO: chưa tìm thấy '{COURT_MODEL_FP16_PATH}'. Tạm dùng bản gốc FP32.")
 
     court_model = load_court_model(
-        court_weights_path,
-        config.NUM_KEYPOINTS,
-        config.DEVICE,
+        COURT_MODEL_FP16_PATH if use_fp16_court else COURT_MODEL_PATH,
         use_fp16=use_fp16_court,
     )
-
     print(f"Court model loaded ({'FP16' if use_fp16_court else 'FP32'}).")
 
-    return ball_model, person_model, court_model
+    return ball_model, person_model, court_model, ball_local_model

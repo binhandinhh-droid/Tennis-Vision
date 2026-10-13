@@ -1,95 +1,85 @@
+"""Mini-map sân tennis (top-down) vẽ ở góc trên bên phải frame."""
+
 import cv2
 import numpy as np
 
-import config
-from court_detector import project_point
+from config import (
+    MINI_COURT_W, MINI_COURT_H, MINI_PADDING, MINI_MARGIN_TOP, MINI_MARGIN_RIGHT,
+    SINGLES_INSET_RATIO, SERVICE_LINE_RATIO_NEAR, SERVICE_LINE_RATIO_FAR, PLAYER_COLORS,
+)
+from geometry import project_point
+
+_MINI_CANVAS_W = MINI_COURT_W + MINI_PADDING * 2
+_MINI_CANVAS_H = MINI_COURT_H + MINI_PADDING * 2
 
 
-def _draw_court_lines(canvas, mini_w, mini_h, pad):
-    """Vẽ khung sân + biên đơn + vạch giao bóng + đường giữa + lưới."""
+def _build_mini_court_base():
+    """Nền mini-map tĩnh (khung sân, biên đơn, vạch giao bóng, đường giữa, lưới) - vẽ 1 lần."""
 
-    # --- Khung sân (biên đôi) ---
-    cv2.rectangle(canvas, (pad, pad), (pad + mini_w, pad + mini_h), (255, 255, 255), 2)
+    canvas = np.full((_MINI_CANVAS_H, _MINI_CANVAS_W, 3), (25, 25, 25), dtype=np.uint8)
 
-    # --- Biên đơn (2 đường dọc thu vào) ---
-    inset = int(mini_w * config.SINGLES_INSET_RATIO)
+    w, h, pad = MINI_COURT_W, MINI_COURT_H, MINI_PADDING
+    white = (255, 255, 255)
 
-    cv2.line(canvas, (pad + inset, pad), (pad + inset, pad + mini_h), (255, 255, 255), 1)
-    cv2.line(canvas, (pad + mini_w - inset, pad), (pad + mini_w - inset, pad + mini_h), (255, 255, 255), 1)
+    cv2.rectangle(canvas, (pad, pad), (pad + w, pad + h), white, 2)
 
-    # --- Vạch giao bóng (service line) 2 bên ---
-    near_y = int(mini_h * config.SERVICE_LINE_RATIO_NEAR)
-    far_y = int(mini_h * config.SERVICE_LINE_RATIO_FAR)
+    inset = int(w * SINGLES_INSET_RATIO)
 
-    cv2.line(canvas, (pad + inset, pad + near_y), (pad + mini_w - inset, pad + near_y), (255, 255, 255), 1)
-    cv2.line(canvas, (pad + inset, pad + far_y), (pad + mini_w - inset, pad + far_y), (255, 255, 255), 1)
+    cv2.line(canvas, (pad + inset, pad), (pad + inset, pad + h), white, 1)
+    cv2.line(canvas, (pad + w - inset, pad), (pad + w - inset, pad + h), white, 1)
 
-    # --- Đường giữa (center line), nối 2 vạch giao bóng ---
-    center_x = pad + mini_w // 2
-    cv2.line(canvas, (center_x, pad + near_y), (center_x, pad + far_y), (255, 255, 255), 1)
+    near_y = int(h * SERVICE_LINE_RATIO_NEAR)
+    far_y = int(h * SERVICE_LINE_RATIO_FAR)
 
-    # --- Lưới (net), ở giữa sân theo chiều dài ---
-    net_y = pad + mini_h // 2
-    cv2.line(canvas, (pad, net_y), (pad + mini_w, net_y), (0, 255, 255), 2)
+    cv2.line(canvas, (pad + inset, pad + near_y), (pad + w - inset, pad + near_y), white, 1)
+    cv2.line(canvas, (pad + inset, pad + far_y), (pad + w - inset, pad + far_y), white, 1)
+
+    center_x = pad + w // 2
+    cv2.line(canvas, (center_x, pad + near_y), (center_x, pad + far_y), white, 1)
+
+    net_y = pad + h // 2
+    cv2.line(canvas, (pad, net_y), (pad + w, net_y), (0, 255, 255), 2)
+
+    return canvas
 
 
-def _blit_canvas(frame, canvas, canvas_w, canvas_h):
-    """Ghép canvas mini-map lên góc trên bên phải của frame chính."""
+_MINI_COURT_BASE = _build_mini_court_base()
 
-    fh, fw = frame.shape[:2]
 
-    x_off = fw - canvas_w - config.MINI_MARGIN_RIGHT
-    y_off = config.MINI_MARGIN_TOP
+def _blit_canvas(frame, canvas):
+    """Ghép canvas mini-map lên góc trên bên phải của frame."""
+
+    x_off = frame.shape[1] - _MINI_CANVAS_W - MINI_MARGIN_RIGHT
+    y_off = MINI_MARGIN_TOP
 
     if x_off < 0 or y_off < 0:
         return
 
-    roi = frame[y_off:y_off + canvas_h, x_off:x_off + canvas_w]
-    blended = cv2.addWeighted(roi, 0.25, canvas, 0.75, 0)
-    frame[y_off:y_off + canvas_h, x_off:x_off + canvas_w] = blended
+    roi = frame[y_off:y_off + _MINI_CANVAS_H, x_off:x_off + _MINI_CANVAS_W]
+    frame[y_off:y_off + _MINI_CANVAS_H, x_off:x_off + _MINI_CANVAS_W] = \
+        cv2.addWeighted(roi, 0.25, canvas, 0.75, 0)
 
     cv2.rectangle(
-        frame,
-        (x_off, y_off),
-        (x_off + canvas_w, y_off + canvas_h),
-        (255, 255, 255),
-        1,
+        frame, (x_off, y_off), (x_off + _MINI_CANVAS_W, y_off + _MINI_CANVAS_H),
+        (255, 255, 255), 1,
     )
 
 
-def draw_mini_court(frame, H, players, ball_point,
-                     mini_w=config.MINI_COURT_W, mini_h=config.MINI_COURT_H,
-                     pad=config.MINI_PADDING):
+def draw_mini_court(frame, H, players, ball_point, marks=None, swing_halves=None):
     """
-    Vẽ mini-map sân tennis (top-down) ở góc trên bên phải của frame.
+    Vẽ mini-map sân tennis (top-down) ở góc trên bên phải frame.
 
     Args:
-        H:            homography đã tính sẵn cho frame hiện tại (dùng
-                       chung với classify_player để đảm bảo nhất quán).
-        players:      list các dict {"point": (x, y), "label": "Player 1"/"Player 2"}
-                       (point là toạ độ điểm chân trên frame gốc)
-        ball_point:   (x, y) toạ độ tâm bóng trên frame gốc, hoặc None
+        H:          homography của frame hiện tại
+        players:    list dict {"point": (x, y), "label": "Player 1"/"Player 2", ...}
+        ball_point: (x, y) tâm bóng trên frame gốc, hoặc None
+        swing_halves: tập half ("Player 1"/"Player 2") đang vung vợt: vẽ vòng đỏ + chữ HIT quanh chấm player
+        marks:      list (x, y) điểm bóng nảy gần đây (toạ độ mini-map), vẽ dấu X; hoặc None
     """
 
-    canvas_w = mini_w + pad * 2
-    canvas_h = mini_h + pad * 2
+    canvas = _MINI_COURT_BASE.copy()
+    pad = MINI_PADDING
 
-    canvas = np.full((canvas_h, canvas_w, 3), (25, 25, 25), dtype=np.uint8)
-
-    _draw_court_lines(canvas, mini_w, mini_h, pad)
-
-    if H is None:
-        fh, fw = frame.shape[:2]
-        x_off = fw - canvas_w - config.MINI_MARGIN_RIGHT
-        y_off = config.MINI_MARGIN_TOP
-
-        if x_off < 0 or y_off < 0:
-            return
-
-        frame[y_off:y_off + canvas_h, x_off:x_off + canvas_w] = canvas
-        return
-
-    # --- Chiếu vị trí player + bóng lên mini-map ---
     for p in players:
 
         proj = project_point(H, p["point"])
@@ -97,14 +87,23 @@ def draw_mini_court(frame, H, players, ball_point,
         if proj is None:
             continue
 
-        px, py = proj
-        px = float(np.clip(px, 0, mini_w))
-        py = float(np.clip(py, 0, mini_h))
+        px = int(np.clip(proj[0], 0, MINI_COURT_W))
+        py = int(np.clip(proj[1], 0, MINI_COURT_H))
 
-        color = (0, 255, 0) if p["label"] == "Player 1" else (255, 128, 0)
+        cv2.circle(canvas, (pad + px, pad + py), 6, PLAYER_COLORS[p["label"]], -1)
+        cv2.circle(canvas, (pad + px, pad + py), 6, (0, 0, 0), 1)
 
-        cv2.circle(canvas, (pad + int(px), pad + int(py)), 6, color, -1)
-        cv2.circle(canvas, (pad + int(px), pad + int(py)), 6, (0, 0, 0), 1)
+        if swing_halves and p["half"] in swing_halves:
+            red = (0, 0, 255)
+            cv2.circle(canvas, (pad + px, pad + py), 13, red, 3)
+            tx = pad + px + 17 if px < MINI_COURT_W / 2 else pad + px - 52
+            cv2.putText(canvas, "HIT", (tx, pad + py + 6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, red, 2)
+
+    for mx, my in (marks or []):
+        cx = pad + int(np.clip(mx, -10, MINI_COURT_W + 10))
+        cy = pad + int(np.clip(my, -10, MINI_COURT_H + 10))
+        cv2.line(canvas, (cx - 4, cy - 4), (cx + 4, cy + 4), (0, 255, 255), 2)
+        cv2.line(canvas, (cx - 4, cy + 4), (cx + 4, cy - 4), (0, 255, 255), 2)
 
     if ball_point is not None:
 
@@ -113,12 +112,11 @@ def draw_mini_court(frame, H, players, ball_point,
         if proj is not None:
             bx, by = proj
 
-            # chỉ vẽ nếu bóng nằm gần khu vực sân (kể cả hơi bay ra ngoài
-            # biên một chút khi giao bóng / trả bóng ở góc)
-            if -30 <= bx <= mini_w + 30 and -30 <= by <= mini_h + 30:
-                bx = float(np.clip(bx, 0, mini_w))
-                by = float(np.clip(by, 0, mini_h))
+            # Chỉ vẽ nếu bóng nằm gần sân (cho phép bay ra ngoài biên một chút)
+            if -30 <= bx <= MINI_COURT_W + 30 and -30 <= by <= MINI_COURT_H + 30:
+                bx = int(np.clip(bx, 0, MINI_COURT_W))
+                by = int(np.clip(by, 0, MINI_COURT_H))
 
-                cv2.circle(canvas, (pad + int(bx), pad + int(by)), 4, (0, 0, 255), -1)
+                cv2.circle(canvas, (pad + bx, pad + by), 4, (0, 0, 255), -1)
 
-    _blit_canvas(frame, canvas, canvas_w, canvas_h)
+    _blit_canvas(frame, canvas)
