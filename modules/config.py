@@ -1,9 +1,18 @@
 """Toàn bộ cấu hình / hằng số của pipeline Tennis Analysis."""
 
 import os
+from pathlib import Path
 
 import numpy as np
 import torch
+
+# Thư mục gốc của project: mọi đường dẫn mặc định tính từ đây (có thể ghi đè bằng biến môi trường).
+ROOT = Path(__file__).resolve().parent
+
+
+def _path(env_name, default):
+    return os.environ.get(env_name, str(default))
+
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -11,10 +20,10 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEBUG_MODE = False
 
 # ---- Model paths ----
-BALL_MODEL_PATH = r"D:\project\tennis_analysis\weights\best_yolov26m.pt"
+BALL_MODEL_PATH = _path("TENNIS_BALL_MODEL", ROOT / "weights" / "best_yolov26m.pt")
 # Model pose (box người + keypoint cổ tay). Tên trần -> ultralytics tự tải về lần đầu.
 # YOLO26x-pose chính xác hơn hẳn yolov8m-pose; nếu tải không được sẽ thử PERSON_MODEL_FALLBACKS.
-PERSON_MODEL_PATH = r"D:\project\tennis_analysis\weights\yolo26x-pose.pt"
+PERSON_MODEL_PATH = _path("TENNIS_PERSON_MODEL", ROOT / "weights" / "yolo26x-pose.pt")
 PERSON_MODEL_FALLBACKS = ["yolo11x-pose.pt", "yolo11l-pose.pt"]
 PERSON_IMGSZ = 1280   # (chỉ dùng cho model .pt) imgsz cho vùng crop quanh sân (player ở xa nhỏ -> cần lớn). Engine TensorRT: export đúng imgsz này
 # ---- Shape engine TensorRT (h, w) - HÌNH CHỮ NHẬT để không tính toán trên phần padding ----
@@ -26,12 +35,12 @@ PERSON_ENGINE_IMGSZ = (736, 1280)
 
 PREVIEW_EVERY = 3   # chỉ hiện preview mỗi N frame (imshow + resize tốn vài ms/frame)
 
-COURT_MODEL_PATH = r"D:\project\tennis_analysis\weights\best_tennis_court_checkpoint.pth"
+COURT_MODEL_PATH = _path("TENNIS_COURT_MODEL", ROOT / "weights" / "best_tennis_court_checkpoint.pth")
 
 NUM_KEYPOINTS = 14
 
 # ---- Video I/O ----
-INPUT_VIDEO = r"D:\project\tennis_analysis\input_video\input_video_v5.mp4"
+INPUT_VIDEO = _path("TENNIS_INPUT_VIDEO", ROOT / "input_video" / "input_video.mp4")
 OUTPUT_VIDEO = os.path.splitext(INPUT_VIDEO)[0] + "_result.mp4"   # cùng thư mục, hậu tố "_result"
 IO_QUEUE_SIZE = 16   # số frame tối đa nằm chờ trong queue đọc / ghi
 
@@ -47,7 +56,6 @@ BALL_GLOBAL_CONF = 0.5
 # Tracking state
 BALL_LOST_PATIENCE = 5
 BALL_SEARCH_GROWTH = 0.35
-BALL_MAX_SEARCH_MARGIN = 360   # (không còn module nào dùng; ball_tracker dùng BALL_LOCAL_MAX_MARGIN)
 
 # ---- Court cache / optical flow ----
 # Detect lại sân (KeypointRCNN, thread nền) theo NHU CẦU thay vì chu kỳ cố định:
@@ -150,8 +158,6 @@ BOUNCE_MARK_S = 3.0                # thời gian hiện dấu X trên mini-map
 # ---- Loại "nảy giả" do cú đánh (sổ cú đánh) ----
 HIT_SIDE_EXCL_S = 1.0       # sau cú đánh của A, trong N giây không chấp nhận nảy ở nửa sân của A (cú đánh sang sân đối thủ)
 HIT_AFTER_TOL_S = 0.10      # cú đánh được ghi nhận trễ tối đa N giây so với frame ứng viên nảy vẫn tính là liên quan
-HIT_NEAR_EXCL_S = 0.35      # trong N giây sau cú đánh, ứng viên nảy sát chân người đánh bị loại
-HIT_NEAR_M = 2.5            # "sát chân" = trong bán kính N mét (tính trên mini-map)
 HIT_EVENT_KEEP_S = 4.0      # giữ sổ cú đánh bao lâu
 # Phát hiện cú đánh từ QUỸ ĐẠO bóng (không cần skeleton): bóng trong tầm vợt, tiến sát rồi rời xa
 # player, hướng đi đảo ngược và KHÔNG mất tốc như khi nảy.
@@ -162,8 +168,6 @@ HIT_TRAJ_SPEED_RATIO = 0.8       # tốc độ sau / trước >= mức này (bó
 HIT_TRAJ_GROUND_RATIO = 1.2      # bóng ở ngang chân (dễ lẫn với nảy): đòi tốc độ sau / trước >= mức này
 HIT_TRAJ_APPROACH_H = 0.08       # bóng phải tiến sát rồi rời xa tâm player ít nhất N * chiều cao người ở 2 đầu cửa sổ
 HIT_DUP_S = 0.25                 # 2 tín hiệu đánh của cùng 1 người cách nhau < N giây coi là cùng 1 cú
-SAME_HALF_RALLY_S = 2.0     # nảy lần 2 cùng nửa sân trong N giây ...
-SAME_HALF_NEAR_M = 3.5      # ... mà sát chân người ở nửa đó (N mét) -> coi là cú đánh bị bỏ sót
 
 # ---- Phát hiện vung vợt (keypoint cổ tay từ YOLO-pose) ----
 KP_WRISTS = (9, 10)                # COCO: left_wrist, right_wrist
@@ -196,14 +200,15 @@ SCENE_BANNER_S = 1.5          # thời gian hiện chữ "SCENE CHANGE" trên m�
 COURT_DROP_AFTER_FAILS = 2    # detect sân đồng bộ thất bại (độ tin cậy < COURT_DETECT_SCORE_THRESH) N lần liên tiếp -> bỏ sân cũ
 
 # ---- Lượng tử hóa (tự fallback về FP32 nếu chưa có file) ----
-USE_TENSORRT_BALL = True
-USE_TENSORRT_PERSON = True   # bật lại sau khi export engine cho model mới (xem hướng dẫn)
+USE_TENSORRT_BALL = False   # bật sau khi export engine (xem export_engines.py)
+USE_TENSORRT_PERSON = False  # bật sau khi export engine (xem export_engines.py)
 USE_FP16_COURT = False
 
 BALL_MODEL_ENGINE_PATH = BALL_MODEL_PATH.replace(".pt", ".engine")
 PERSON_MODEL_ENGINE_PATH = PERSON_MODEL_PATH.replace(".pt", ".engine")
 COURT_MODEL_FP16_PATH = COURT_MODEL_PATH.replace(".pth", "_fp16.pth")
 
-# Engine nhỏ (imgsz thấp, FP16) chỉ dùng cho local search quanh bóng (quantize_ball_local.py).
-USE_BALL_LOCAL_ENGINE = True
+# Engine nhỏ (imgsz thấp, FP16) chỉ dùng cho local search quanh bóng (export_engines.py, EXPORT_BALL_LOCAL = True).
+USE_BALL_LOCAL_ENGINE = False
 BALL_LOCAL_ENGINE_PATH = BALL_MODEL_PATH.replace(".pt", "_local.engine")
+BALL_LOCAL_ENGINE_IMGSZ = 192   # imgsz lúc export engine ROI (export_engines.py)
