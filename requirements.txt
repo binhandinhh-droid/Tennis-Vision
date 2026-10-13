@@ -1,0 +1,8 @@
+numpy
+opencv-python
+torch
+torchvision
+ultralytics
+
+# Tuỳ chọn: tăng tốc bằng TensorRT (cần GPU NVIDIA)
+# tensorrt
