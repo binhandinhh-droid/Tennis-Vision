@@ -4,5 +4,5 @@ torch
 torchvision
 ultralytics
 
-# Tuỳ chọn: tăng tốc bằng TensorRT (cần GPU NVIDIA)
+# Optional: TensorRT acceleration (needs an NVIDIA GPU)
 # tensorrt

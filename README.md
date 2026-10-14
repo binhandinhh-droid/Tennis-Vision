@@ -1,20 +1,20 @@
 # Tennis Analysis
 
-Phân tích video tennis broadcast: nhận diện sân, người chơi, bóng, điểm bóng nảy và cú đánh, hiển thị mini-map top-down.
+Analyze broadcast tennis video: detect the court, players, ball, bounce points and hits, and render a top-down mini-map.
 
-<!-- Thay bằng GIF demo của bạn: -->
+<!-- Replace with your demo GIF: -->
 <!-- ![demo](assets/demo.gif) -->
 
-## Tính năng
+## Features
 
-- **Sân**: KeypointRCNN lấy 14 keypoint, tinh chỉnh bằng CV cổ điển (Hough), kiểm tra hình học có đúng là sân; bám theo camera bằng optical flow, detect lại ở thread nền khi cần.
-- **Người chơi**: YOLO-pose trên vùng crop quanh sân, `PlayerMemory` giữ đúng 1 người mỗi nửa sân.
-- **Bóng**: tìm cục bộ quanh vị trí cũ (ROI), fallback quét toàn frame.
-- **Bóng nảy**: phát hiện từ quỹ đạo, loại các "nảy giả" do cú đánh.
-- **Cú vung vợt**: từ chuyển động cổ tay so với thân (YOLO-pose keypoint).
-- **Chuyển cảnh**: cut / dissolve / mất sân, tự reset các tracker.
-- **Mini-map**: vị trí người, bóng, dấu X điểm nảy, ký hiệu HIT.
-- Tuỳ chọn tăng tốc bằng **TensorRT FP16**.
+- **Court**: KeypointRCNN predicts 14 court keypoints, refined with classical CV (Hough lines) and validated geometrically; tracked across camera motion with optical flow, and re-detected in a background thread when needed.
+- **Players**: YOLO-pose on a crop around the court; `PlayerMemory` keeps exactly one player per half of the court.
+- **Ball**: local search (ROI) around the previous position, with a full-frame fallback.
+- **Bounces**: detected from the ball trajectory, rejecting "fake bounces" caused by hits.
+- **Swings**: detected from wrist motion relative to the torso (YOLO-pose keypoints).
+- **Scene changes**: cut / dissolve / court loss, automatically resetting the trackers.
+- **Mini-map**: player positions, ball, X marks for bounce points, and a HIT marker.
+- Optional **TensorRT FP16** acceleration.
 
 ## Pipeline
 
@@ -28,60 +28,64 @@ flowchart LR
   B --> D
   C --> M[Mini-map]
   D --> M
-  M --> O[Video đầu ra]
+  M --> O[Output video]
 ```
 
-## Cài đặt
+## Installation
 
 ```bash
-git clone https://github.com/<ten-ban>/tennis-analysis.git
+git clone https://github.com/<your-username>/tennis-analysis.git
 cd tennis-analysis
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Cài `torch` đúng bản CUDA của máy theo hướng dẫn tại pytorch.org. Tải weights theo [weights/README.md](weights/README.md).
+Install `torch` with the CUDA build matching your machine (see pytorch.org). Download the weights as described in [weights/README.md](weights/README.md).
 
-## Chạy
+## Usage
 
 ```bash
 python main.py --input path/to/video.mp4
 python main.py --input video.mp4 --output out.mp4 --no-preview --max-frames 500
 ```
 
-Phím `q` trong cửa sổ preview để thoát. Đặt `DEBUG_MODE = True` trong `config.py` để xem thêm box phụ và log lý do bỏ từng lần nảy.
+Press `q` in the preview window to quit. Set `DEBUG_MODE = True` in `config.py` to draw extra boxes and print the reason each bounce candidate was rejected.
 
-## Cấu hình
+## Configuration
 
-Mọi hằng số nằm trong `config.py`, có chú thích hướng chỉnh. Hay dùng nhất:
+All constants live in `config.py`, with comments on how to tune them. The most commonly adjusted ones:
 
-| Tham số | Ý nghĩa |
-|---------|---------|
-| `BALL_LOCAL_CONF` / `BALL_GLOBAL_CONF` | ngưỡng tin cậy bóng |
-| `BOUNCE_MIN_DROP_PX`, `BOUNCE_MIN_DVY_PX` | độ nhạy phát hiện nảy |
-| `SWING_SPEED_H_PER_S` | ngưỡng tốc độ cổ tay tính là vung vợt |
-| `HIT_SIDE_EXCL_S` | thời gian loại nảy ở nửa sân người vừa đánh |
+| Parameter | Meaning |
+|-----------|---------|
+| `BALL_LOCAL_CONF` / `BALL_GLOBAL_CONF` | ball confidence thresholds |
+| `BOUNCE_MIN_DROP_PX`, `BOUNCE_MIN_DVY_PX` | bounce detection sensitivity |
+| `SWING_SPEED_H_PER_S` | wrist speed threshold that counts as a racket swing |
+| `HIT_SIDE_EXCL_S` | how long bounces are rejected on the half of the player who just hit |
 
-## Tăng tốc bằng TensorRT (tuỳ chọn)
+## TensorRT acceleration (optional)
 
-Cần GPU NVIDIA và `pip install tensorrt`.
+Requires an NVIDIA GPU and `pip install tensorrt`.
 
-1. `python measure_person_crop.py <video>` để đo kích thước crop, điền `PERSON_ENGINE_IMGSZ` trong `config.py`.
-2. Chỉnh các cờ `EXPORT_*` trong `export_engines.py`, chạy `python export_engines.py`.
-3. Bật `USE_TENSORRT_BALL`, `USE_TENSORRT_PERSON`, `USE_BALL_LOCAL_ENGINE` trong `config.py`.
+1. `python measure_person_crop.py <video>` to measure the crop size, then set `PERSON_ENGINE_IMGSZ` in `config.py`.
+2. Adjust the `EXPORT_*` flags in `export_engines.py` and run `python export_engines.py`.
+3. Turn on `USE_TENSORRT_BALL`, `USE_TENSORRT_PERSON` and `USE_BALL_LOCAL_ENGINE` in `config.py`.
 
-Engine gắn với đúng GPU và phiên bản TensorRT đã export; đổi máy thì export lại.
+An engine is tied to the exact GPU and TensorRT version it was exported on; re-export after changing machines.
 
-## Hạn chế đã biết
+## Profiling
 
-- Thiết kế cho camera broadcast nhìn từ sau baseline.
-- Model bóng đôi khi nhầm chấm trắng nhỏ trên vạch sân thành bóng.
-- Các ngưỡng bounce/swing chỉnh theo video thử nghiệm, video khác có thể cần chỉnh lại.
+`python profile_bottleneck.py --video path/to/video.mp4` measures the time of every pipeline stage, reports spikes, and suggests what to optimize.
+
+## Known limitations
+
+- Designed for broadcast cameras looking from behind the baseline.
+- The ball model sometimes mistakes small white spots on the court lines for the ball.
+- The bounce/swing thresholds were tuned on the test video; other videos may need re-tuning.
 
 ## Credits
 
-[Ultralytics YOLO](https://github.com/ultralytics/ultralytics) (AGPL-3.0), [torchvision](https://github.com/pytorch/vision), OpenCV. Ghi thêm dataset dùng để train.
+[Ultralytics YOLO](https://github.com/ultralytics/ultralytics) (AGPL-3.0), [torchvision](https://github.com/pytorch/vision), OpenCV. Also credit the dataset(s) used for training.
 
 ## License
 
-Chọn license rồi thêm file `LICENSE` (xem lưu ý về AGPL-3.0 của ultralytics).
+Choose a license and add a `LICENSE` file (note that ultralytics is AGPL-3.0).
