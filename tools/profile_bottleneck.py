@@ -1,16 +1,16 @@
 """
 PROFILE BOTTLENECK - Tennis Analysis
-Đo thời gian từng stage của pipeline (không sửa code pipeline: bọc hàm lúc chạy), chỉ ra stage nào
-chiếm nhiều thời gian nhất, frame nào bị giật (spike) và vì stage nào.
+Measures the time of each pipeline stage (does not modify the pipeline code: functions are wrapped at run time),
+shows which stage takes the most time, which frames stutter (spikes) and because of which stage.
 
-Chạy (đặt cùng thư mục với main.py):
+Run (place it in the same folder as main.py):
     python profile_bottleneck.py                  # video = config.INPUT_VIDEO
-    python profile_bottleneck.py --video "D:\\a.mp4" --frames 400
-    python profile_bottleneck.py --ask            # chọn video bằng hộp thoại
-    python profile_bottleneck.py --no-sync        # không đồng bộ CUDA (thời gian GPU sẽ dồn vào stage sau)
-    python profile_bottleneck.py --selftest       # kiểm tra chính công cụ, không cần model / GPU
+    python profile_bottleneck.py --video "path/to/video.mp4" --frames 400
+    python profile_bottleneck.py --ask            # choose the video with a file dialog
+    python profile_bottleneck.py --no-sync        # do not synchronize CUDA (GPU time will pile up in the next stage)
+    python profile_bottleneck.py --selftest       # test the tool itself, no model / GPU needed
 
-Kết quả: bảng trong console + CSV từng frame + biểu đồ PNG trong REPORT_DIR.
+Output: tables in the console + a per-frame CSV + a PNG plot in REPORT_DIR.
 """
 
 import argparse
@@ -34,50 +34,50 @@ except Exception:  # noqa: BLE001
     torch = None
 
 # =====================================================================
-# CÀI ĐẶT NGƯỜI DÙNG
+# USER SETTINGS
 # =====================================================================
 REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profile_report")
-WARMUP_FRAMES = 20        # bỏ N frame đầu (khởi tạo CUDA / TensorRT / cudnn), báo riêng
-MEASURE_FRAMES = 300      # số frame đo sau warmup
-SYNC_CUDA = True          # đồng bộ CUDA quanh mỗi stage -> thời gian GPU tính đúng stage (chậm hơn chút)
-WRITE_OUTPUT = True       # ghi video thật (để đo chi phí encode); file tạm, xoá sau khi đo
-PREVIEW = False           # True = đo cả imshow (thường làm số đo nhiễu)
-USE_CPROFILE = False      # True = thêm cProfile mức hàm Python (chậm hơn ~2x, chỉ để xem hotspot CPU)
-SPIKE_FACTOR = 2.0        # frame có thời gian > N * median (hoặc > p95) là spike
+WARMUP_FRAMES = 20        # skip the first N frames (CUDA / TensorRT / cudnn initialization), reported separately
+MEASURE_FRAMES = 300      # number of frames measured after warmup
+SYNC_CUDA = True          # synchronize CUDA around each stage -> GPU time is attributed to the right stage (slightly slower)
+WRITE_OUTPUT = True       # write a real video (to measure encode cost); temporary file, deleted after measuring
+PREVIEW = False           # True = also measure imshow (usually makes the numbers noisy)
+USE_CPROFILE = False      # True = add function-level cProfile (about 2x slower, only to see CPU hotspots)
+SPIKE_FACTOR = 2.0        # a frame taking > N * median (or > p95) is a spike
 SAVE_CSV = True
-SAVE_PLOT = True          # cần matplotlib (không có thì bỏ qua)
+SAVE_PLOT = True          # needs matplotlib (skipped if missing)
 
-# Gợi ý theo stage: (tiền tố nhãn, gợi ý). Khớp theo thứ tự.
+# Tips per stage: (label prefix, tip). Matched in order.
 ADVICE = [
-    ("person.predict", "Model người: giảm PERSON_IMGSZ (1280 -> 960), dùng TensorRT (export engine + USE_TENSORRT_PERSON=True), "
-                       "hoặc dùng model nhỏ hơn (yolo26l/m-pose); hoặc chạy person mỗi 2 frame và để PlayerMemory coast."),
-    ("ball.predict[global]", "Quét toàn frame bằng model bóng rất tốn: tăng BALL_LOST_PATIENCE / BALL_LOCAL_MAX_MARGIN để ít rơi về global, "
-                             "hoặc export engine TensorRT cho model bóng (USE_TENSORRT_BALL)."),
-    ("ball.predict[local]", "Local search tốn: dùng engine local nhỏ (USE_BALL_LOCAL_ENGINE) hoặc giảm BALL_LOCAL_IMGSZ_MAX."),
-    ("court.detect", "KeypointRCNN đồng bộ chặn main loop: tăng COURT_MIN_INTERVAL, dùng USE_FP16_COURT, hoặc giảm số lần mất track "
+    ("person.predict", "Person model: lower PERSON_IMGSZ (1280 -> 960), use TensorRT (export the engine + USE_TENSORRT_PERSON=True), "
+                       "or use a smaller model (yolo26l/m-pose); or run the person model every 2 frames and let PlayerMemory coast."),
+    ("ball.predict[global]", "Full-frame scanning with the ball model is expensive: raise BALL_LOST_PATIENCE / BALL_LOCAL_MAX_MARGIN to fall back to global less often, "
+                             "or export a TensorRT engine for the ball model (USE_TENSORRT_BALL)."),
+    ("ball.predict[local]", "Local search is expensive: use the small local engine (USE_BALL_LOCAL_ENGINE) or lower BALL_LOCAL_IMGSZ_MAX."),
+    ("court.detect", "Synchronous KeypointRCNN blocks the main loop: raise COURT_MIN_INTERVAL, use USE_FP16_COURT, or reduce how often tracking is lost "
                      "(COURT_TRACK_MIN_VALID_RATIO)."),
-    ("court.refine_kp", "refine_keypoint_by_lines (Canny + Hough x14 điểm): giảm REFINE_CROP_HALF hoặc bỏ refine khi detect nền."),
-    ("court.validate", "is_valid_court (lấy mẫu pixel dọc cạnh): giảm số điểm mẫu (np.linspace 24 -> 12)."),
-    ("court.optical_flow", "Optical flow: giảm OPTICAL_FLOW_SCALE (0.5 -> 0.35) hoặc LK_PARAMS maxLevel/winSize."),
-    ("court.homography", "Tính homography mỗi lần set court: gọi ít hơn khi camera đứng yên."),
-    ("court.update", "Logic court tracker (cvtColor + resize ảnh xám mỗi frame): đọc thêm phần 'court.*' bên dưới."),
-    ("io.read_wait", "Decode video là cổ chai (main loop chờ reader): dùng decode GPU (NVDEC) / giảm độ phân giải / tăng IO_QUEUE_SIZE."),
-    ("io.write_put", "Encode/ghi video là cổ chai (queue ghi đầy): dùng NVENC/ffmpeg thay mp4v, hoặc giảm độ phân giải đầu ra."),
-    ("io.preview", "imshow + resize preview: tắt show_preview khi xử lý hàng loạt."),
-    ("draw.", "Vẽ overlay: đơn giản hoá (tắt DEBUG_MODE, bỏ addWeighted mini-map nhiều lần)."),
-    ("scene.", "SceneMonitor: histogram 160x90 mỗi frame - hiếm khi là cổ chai; nếu lớn kiểm tra cv2.resize / calcHist."),
-    ("swing.", "Swing detector (dict + numpy nhỏ mỗi frame): nếu lớn, cache by_frame thay vì dựng lại mỗi frame."),
-    ("bounce.", "Bounce detector: np.polyfit trong _slope / _trajectory_hit gọi mỗi frame - thay bằng công thức hồi quy tuyến tính trực tiếp."),
-    ("person.candidates", "Gom candidate người: nhẹ; nếu lớn kiểm tra classify_player / project_point."),
-    ("person.crop", "Crop quanh sân: nhẹ."),
-    ("process_frame", "Phần còn lại trong process_frame (frame.copy, ...): copy ảnh 1080p mỗi frame; cân nhắc vẽ trực tiếp lên frame."),
+    ("court.refine_kp", "refine_keypoint_by_lines (Canny + Hough x14 points): lower REFINE_CROP_HALF or skip refinement during background detection."),
+    ("court.validate", "is_valid_court (samples pixels along the edges): reduce the number of sample points (np.linspace 24 -> 12)."),
+    ("court.optical_flow", "Optical flow: lower OPTICAL_FLOW_SCALE (0.5 -> 0.35) or LK_PARAMS maxLevel/winSize."),
+    ("court.homography", "Homography is computed every time the court is set: call it less often when the camera is still."),
+    ("court.update", "Court tracker logic (cvtColor + grayscale resize every frame): see the 'court.*' entries below."),
+    ("io.read_wait", "Video decoding is the bottleneck (the main loop waits for the reader): use GPU decoding (NVDEC) / lower the resolution / raise IO_QUEUE_SIZE."),
+    ("io.write_put", "Video encoding / writing is the bottleneck (the write queue is full): use NVENC/ffmpeg instead of mp4v, or lower the output resolution."),
+    ("io.preview", "imshow + preview resize: turn off show_preview for batch processing."),
+    ("draw.", "Overlay drawing: simplify (turn off DEBUG_MODE, avoid repeated mini-map addWeighted)."),
+    ("scene.", "SceneMonitor: a 160x90 histogram every frame - rarely a bottleneck; if it is large, check cv2.resize / calcHist."),
+    ("swing.", "Swing detector (small dicts + numpy every frame): if large, cache by_frame instead of rebuilding it every frame."),
+    ("bounce.", "Bounce detector: np.polyfit in _slope / _trajectory_hit is called every frame - replace it with a direct linear regression formula."),
+    ("person.candidates", "Person candidate grouping: light; if large, check classify_player / project_point."),
+    ("person.crop", "Crop around the court: light."),
+    ("process_frame", "The rest of process_frame (frame.copy, ...): copies a 1080p image every frame; consider drawing directly on the frame."),
 ]
 
 GPU_LABELS = ("person.predict", "ball.predict", "court.detect")
 
 
 # =====================================================================
-# TIMER (phân cấp: self time = inclusive - thời gian các stage con)
+# TIMER (hierarchical: self time = inclusive - time of child stages)
 # =====================================================================
 class Timer:
     def __init__(self, sync=True):
@@ -86,7 +86,7 @@ class Timer:
         self.stack = []
         self.cur = None
         self.frames = []
-        self.bg = defaultdict(lambda: [0, 0.0, 0.0])   # label -> [số lần, tổng ms, max ms] (thread nền)
+        self.bg = defaultdict(lambda: [0, 0.0, 0.0])   # label -> [count, total ms, max ms] (background threads)
         self._lock = threading.Lock()
 
     def _cuda_sync(self):
@@ -152,7 +152,7 @@ class _Section:
 
 
 def wrap_attr(owner, name, label, timer):
-    """Thay owner.name bằng bản bọc đo thời gian. label có thể là hàm (args, kwargs) -> str."""
+    """Replace owner.name with a timing wrapper. label may be a function (args, kwargs) -> str."""
 
     fn = getattr(owner, name)
 
@@ -165,14 +165,14 @@ def wrap_attr(owner, name, label, timer):
 
 
 # =====================================================================
-# BÁO CÁO
+# REPORT
 # =====================================================================
 def _group_of(label):
     if label.startswith("io."):
-        return "IO (đọc/ghi/preview)"
+        return "IO (read/write/preview)"
     if any(label.startswith(g) for g in GPU_LABELS):
         return "GPU inference"
-    return "CPU (logic / hình học / vẽ)"
+    return "CPU (logic / geometry / drawing)"
 
 
 def _pct(a, q):
@@ -180,12 +180,12 @@ def _pct(a, q):
 
 
 def analyze(frames, bg, info):
-    """In báo cáo. Returns dict kết quả (dùng cho CSV / plot)."""
+    """Print the report. Returns a result dict (used for the CSV / plot)."""
 
     n = len(frames)
 
     if n == 0:
-        print("Không có frame nào để phân tích.")
+        print("No frames to analyze.")
         return {}
 
     labels = sorted({l for f in frames for l in f["self"]})
@@ -199,45 +199,45 @@ def analyze(frames, bg, info):
     unacc = np.maximum(walls - S.sum(1), 0.0)
 
     print("\n" + "=" * 100)
-    print(f"KẾT QUẢ ĐO  ({n} frame sau warmup)   video: {info.get('video', '?')}  "
+    print(f"RESULTS  ({n} frames after warmup)   video: {info.get('video', '?')}  "
           f"{info.get('w', '?')}x{info.get('h', '?')} @ {info.get('fps', 0):.1f}fps")
     print("=" * 100)
-    print(f"Thời gian/frame: mean {mean_wall:.1f} ms | median {_pct(walls, 50):.1f} | p95 {_pct(walls, 95):.1f} "
+    print(f"Time/frame: mean {mean_wall:.1f} ms | median {_pct(walls, 50):.1f} | p95 {_pct(walls, 95):.1f} "
           f"| p99 {_pct(walls, 99):.1f} | max {walls.max():.1f} ms")
     print(f"FPS: mean {fps_mean:.1f} | 1% low {1000.0 / max(_pct(walls, 99), 1e-6):.1f}"
-          + (f" | video gốc {info['fps']:.1f}fps -> {'ĐỦ realtime' if fps_mean >= info['fps'] else 'CHƯA realtime'}"
+          + (f" | source video {info['fps']:.1f}fps -> {'REALTIME OK' if fps_mean >= info['fps'] else 'NOT realtime'}"
              if info.get("fps") else ""))
-    print(f"CUDA sync quanh stage: {'BẬT' if info.get('sync') else 'TẮT (thời gian GPU có thể dồn sang stage sau)'}")
+    print(f"CUDA sync around stages: {'ON' if info.get('sync') else 'OFF (GPU time may pile up in the next stage)'}")
 
-    # ---- Bảng theo stage ----
+    # ---- Per-stage table ----
     order = np.argsort(-S.mean(0))
-    print("\n--- Thời gian THEO STAGE (self = trừ stage con; sắp theo self giảm dần) ---")
-    print(f"{'stage':<26}{'gọi/frame':>10}{'self ms':>10}{'% frame':>9}{'p95':>9}{'max':>9}{'incl ms':>10}")
+    print("\n--- Time PER STAGE (self = excluding child stages; sorted by self, descending) ---")
+    print(f"{'stage':<26}{'calls/fr':>10}{'self ms':>10}{'% frame':>9}{'p95':>9}{'max':>9}{'incl ms':>10}")
 
     for j in order:
         s = S[:, j]
         print(f"{labels[j]:<26}{C[:, j].mean():>10.2f}{s.mean():>10.2f}{100 * s.mean() / mean_wall:>8.1f}%"
               f"{_pct(s, 95):>9.1f}{s.max():>9.1f}{I[:, j].mean():>10.2f}")
 
-    print(f"{'(chưa gán / overhead)':<26}{'':>10}{unacc.mean():>10.2f}{100 * unacc.mean() / mean_wall:>8.1f}%")
+    print(f"{'(unassigned / overhead)':<26}{'':>10}{unacc.mean():>10.2f}{100 * unacc.mean() / mean_wall:>8.1f}%")
 
-    # ---- Theo nhóm ----
+    # ---- By group ----
     groups = defaultdict(float)
 
     for j, l in enumerate(labels):
         groups[_group_of(l)] += S[:, j].mean()
 
-    print("\n--- Theo NHÓM ---")
+    print("\n--- By GROUP ---")
 
     for g, v in sorted(groups.items(), key=lambda kv: -kv[1]):
         print(f"{g:<30}{v:>8.1f} ms  {100 * v / mean_wall:>5.1f}%")
 
-    # ---- Nếu bỏ stage X thì FPS bao nhiêu ----
-    print("\n--- Nếu stage này nhanh gấp đôi / bỏ hẳn thì FPS ước tính ---")
+    # ---- What would the FPS be without stage X ----
+    print("\n--- Estimated FPS if this stage were twice as fast / removed entirely ---")
 
     for j in order[:5]:
         m = S[:, j].mean()
-        print(f"{labels[j]:<26} x2: {1000.0 / (mean_wall - m / 2):>6.1f} fps   bỏ hẳn: {1000.0 / max(mean_wall - m, 1e-6):>6.1f} fps")
+        print(f"{labels[j]:<26} x2: {1000.0 / (mean_wall - m / 2):>6.1f} fps   removed: {1000.0 / max(mean_wall - m, 1e-6):>6.1f} fps")
 
     # ---- Spike ----
     thr = max(_pct(walls, 95), SPIKE_FACTOR * float(np.median(walls)))
@@ -248,8 +248,8 @@ def analyze(frames, bg, info):
 
     if spike.sum() and (~spike).sum():
         diff = S[spike].mean(0) - S[~spike].mean(0)
-        print(f"\n--- SPIKE: {int(spike.sum())} frame >= {thr:.0f} ms (bình thường ~{walls[~spike].mean():.0f} ms) ---")
-        print("Stage gây spike (tăng thêm so với frame thường):")
+        print(f"\n--- SPIKE: {int(spike.sum())} frame >= {thr:.0f} ms (normally ~{walls[~spike].mean():.0f} ms) ---")
+        print("Stages causing spikes (extra time versus a normal frame):")
 
         for j in np.argsort(-diff)[:5]:
             if diff[j] > 0.5:
@@ -262,57 +262,57 @@ def analyze(frames, bg, info):
             gaps = gaps[gaps > 1]
 
             if len(gaps) >= 3 and np.std(gaps) <= 0.25 * np.mean(gaps):
-                print(f"  -> spike lặp theo chu kỳ ~{np.mean(gaps):.0f} frame (nghi detect nền / reset định kỳ)")
+                print(f"  -> spikes repeat every ~{np.mean(gaps):.0f} frames (suspect background detection / periodic reset)")
 
-        print("5 frame chậm nhất:")
+        print("5 slowest frames:")
 
         for i in np.argsort(-walls)[:5]:
             top = np.argsort(-S[i])[:3]
             desc = ", ".join(f"{labels[j]} {S[i, j]:.0f}ms" for j in top)
-            print(f"  frame đo #{i:<5} {walls[i]:>7.1f} ms  <- {desc}")
+            print(f"  measured frame #{i:<5} {walls[i]:>7.1f} ms  <- {desc}")
 
-    # ---- Thread nền ----
+    # ---- Background threads ----
     if bg:
-        print("\n--- Thread nền (không chặn main loop, nhưng tranh GPU/CPU) ---")
+        print("\n--- Background threads (do not block the main loop, but compete for GPU/CPU) ---")
 
         for l, (cnt, tot, mx) in bg.items():
-            print(f"{l:<26} {cnt:>5} lần, mean {tot / cnt:>7.1f} ms, max {mx:>7.1f} ms")
+            print(f"{l:<26} {cnt:>5} calls, mean {tot / cnt:>7.1f} ms, max {mx:>7.1f} ms")
 
     # ---- IO queue ----
     qr = [f["q_read"] for f in frames if "q_read" in f]
     qw = [f["q_write"] for f in frames if "q_write" in f]
 
     if qr:
-        print(f"\nQueue đọc trung bình: {np.mean(qr):.1f}/{info.get('qsize', '?')} "
-              f"(≈0: decode không kịp; đầy: GPU/CPU xử lý mới là cổ chai)")
-        print(f"Queue ghi trung bình: {np.mean(qw):.1f}/{info.get('qsize', '?')} (đầy: encode là cổ chai)")
+        print(f"\nAverage read queue: {np.mean(qr):.1f}/{info.get('qsize', '?')} "
+              f"(≈0: decoding cannot keep up; full: GPU/CPU processing is the bottleneck)")
+        print(f"Average write queue: {np.mean(qw):.1f}/{info.get('qsize', '?')} (full: encoding is the bottleneck)")
 
     if info.get("gpu_mem_mb"):
-        print(f"VRAM đỉnh: {info['gpu_mem_mb']:.0f} MB")
+        print(f"Peak VRAM: {info['gpu_mem_mb']:.0f} MB")
 
-    # ---- Kết luận ----
+    # ---- Conclusion ----
     top3 = order[:3]
     print("\n" + "=" * 100)
-    print("KẾT LUẬN")
+    print("CONCLUSION")
     print("=" * 100)
     gpu_share = sum(v for g, v in groups.items() if g.startswith("GPU")) / mean_wall
     io_share = sum(v for g, v in groups.items() if g.startswith("IO")) / mean_wall
     kind = "GPU" if gpu_share >= 0.5 else ("IO" if io_share >= 0.4 else "CPU / Python")
-    print(f"Cổ chai chính: {labels[top3[0]]} ({100 * S[:, top3[0]].mean() / mean_wall:.0f}% thời gian frame). "
-          f"Pipeline nghiêng về: {kind}-bound (GPU {100 * gpu_share:.0f}%, IO {100 * io_share:.0f}%).")
+    print(f"Main bottleneck: {labels[top3[0]]} ({100 * S[:, top3[0]].mean() / mean_wall:.0f}% of frame time). "
+          f"Pipeline is {kind}-bound (GPU {100 * gpu_share:.0f}%, IO {100 * io_share:.0f}%).")
 
     g_calls = C[:, labels.index("ball.predict[global]")].mean() if "ball.predict[global]" in labels else 0.0
     l_calls = C[:, labels.index("ball.predict[local]")].mean() if "ball.predict[local]" in labels else 0.0
 
     if g_calls + l_calls > 0:
-        print(f"Bóng: local {l_calls:.2f} / global {g_calls:.2f} lần predict mỗi frame "
-              f"({100 * g_calls / (g_calls + l_calls):.0f}% là quét toàn frame).")
+        print(f"Ball: local {l_calls:.2f} / global {g_calls:.2f} predict calls per frame "
+              f"({100 * g_calls / (g_calls + l_calls):.0f}% are full-frame scans).")
 
-    print("\nGợi ý cho top 3 stage:")
+    print("\nTips for the top 3 stages:")
 
     for j in top3:
         label = labels[j]
-        tip = next((t for p, t in ADVICE if label.startswith(p)), "Chưa có gợi ý riêng cho stage này.")
+        tip = next((t for p, t in ADVICE if label.startswith(p)), "No specific tip for this stage yet.")
         print(f"- {label} ({S[:, j].mean():.1f} ms): {tip}")
 
     return {"labels": labels, "S": S, "walls": walls, "mean_wall": mean_wall}
@@ -335,7 +335,7 @@ def save_outputs(res, frames):
             for i in range(len(walls)):
                 w.writerow([i, f"{walls[i]:.2f}"] + [f"{v:.2f}" for v in S[i]])
 
-        print(f"\n[OK] CSV từng frame: {path}")
+        print(f"\n[OK] Per-frame CSV: {path}")
 
     if SAVE_PLOT:
         try:
@@ -347,23 +347,23 @@ def save_outputs(res, frames):
             fig, ax = plt.subplots(1, 2, figsize=(14, 5))
             ax[0].barh([labels[j] for j in order], [S[:, j].mean() for j in order])
             ax[0].set_xlabel("ms / frame (self)")
-            ax[0].set_title("Thời gian trung bình theo stage")
+            ax[0].set_title("Mean time per stage")
             ax[1].plot(walls, lw=0.8)
             ax[1].axhline(np.median(walls), color="g", ls="--", label="median")
-            ax[1].set_xlabel("frame đo")
+            ax[1].set_xlabel("measured frame")
             ax[1].set_ylabel("ms")
-            ax[1].set_title("Thời gian mỗi frame (spike = giật)")
+            ax[1].set_title("Time per frame (spike = stutter)")
             ax[1].legend()
             fig.tight_layout()
             path = os.path.join(REPORT_DIR, "bottleneck.png")
             fig.savefig(path, dpi=110)
-            print(f"[OK] Biểu đồ: {path}")
+            print(f"[OK] Plot: {path}")
         except Exception as e:  # noqa: BLE001
-            print(f"[INFO] Bỏ qua biểu đồ ({e})")
+            print(f"[INFO] Skipping plot ({e})")
 
 
 # =====================================================================
-# CHẠY PIPELINE THẬT
+# RUN THE REAL PIPELINE
 # =====================================================================
 def run_pipeline(video, n_measure, sync):
     import cv2
@@ -404,7 +404,7 @@ def run_pipeline(video, n_measure, sync):
 
     timer = Timer(sync=sync)
 
-    # ---- bọc các stage ----
+    # ---- wrap the stages ----
     def ball_label(a, k):
         src = a[0]
         return "ball.predict[global]" if src.shape[:2] == (H, W) else "ball.predict[local]"
@@ -412,7 +412,7 @@ def run_pipeline(video, n_measure, sync):
     wrap_attr(court_tracker, "update", "court.update", timer)
     wrap_attr(CT, "track_court_by_optical_flow", "court.optical_flow", timer)
     wrap_attr(CT, "compute_court_homography", "court.homography", timer)
-    wrap_attr(CT, "detect_court", "court.detect", timer)          # đồng bộ (main) hoặc nền (thread riêng)
+    wrap_attr(CT, "detect_court", "court.detect", timer)          # synchronous (main) or background (own thread)
     wrap_attr(CD, "refine_keypoint_by_lines", "court.refine_kp", timer)
     wrap_attr(CD, "is_valid_court", "court.validate", timer)
 
@@ -446,7 +446,7 @@ def run_pipeline(video, n_measure, sync):
     total_frames = WARMUP_FRAMES + n_measure
     warm_walls = []
 
-    print(f"[INFO] Warmup {WARMUP_FRAMES} frame, đo {n_measure} frame ...")
+    print(f"[INFO] Warmup {WARMUP_FRAMES} frames, measuring {n_measure} frames ...")
 
     try:
         for i in range(total_frames):
@@ -489,7 +489,7 @@ def run_pipeline(video, n_measure, sync):
             else:
                 warm_walls.append(wall * 1e3)
                 timer.cur = None
-                timer.bg.clear() if i == WARMUP_FRAMES - 1 else None   # thread nền của warmup không tính
+                timer.bg.clear() if i == WARMUP_FRAMES - 1 else None   # warmup background threads are not counted
     finally:
         if profiler is not None:
             profiler.disable()
@@ -508,8 +508,8 @@ def run_pipeline(video, n_measure, sync):
             pass
 
     if warm_walls:
-        print(f"[INFO] Warmup: frame đầu {warm_walls[0]:.0f} ms (cold start), "
-              f"trung bình warmup {np.mean(warm_walls):.0f} ms")
+        print(f"[INFO] Warmup: first frame {warm_walls[0]:.0f} ms (cold start), "
+              f"warmup average {np.mean(warm_walls):.0f} ms")
 
     info = {"video": os.path.basename(video), "w": W, "h": H, "fps": fps, "sync": timer.sync,
             "qsize": IO_QUEUE_SIZE}
@@ -523,12 +523,12 @@ def run_pipeline(video, n_measure, sync):
     if profiler is not None:
         s = io.StringIO()
         pstats.Stats(profiler, stream=s).sort_stats("tottime").print_stats(25)
-        print("\n--- cProfile (top 25 theo tottime, chỉ main thread) ---")
+        print("\n--- cProfile (top 25 by tottime, main thread only) ---")
         print(s.getvalue())
 
 
 # =====================================================================
-# SELF-TEST (không cần model / GPU)
+# SELF-TEST (no model / GPU needed)
 # =====================================================================
 def selftest():
     tm = Timer(sync=False)
@@ -550,7 +550,7 @@ def selftest():
             with tm.section("court.update"):
                 stage("court.optical_flow", 3)
 
-                if i % 20 == 0:                       # spike chu kỳ: detect đồng bộ
+                if i % 20 == 0:                       # periodic spike: synchronous detect
                     stage("court.detect", 60)
 
                 if i % 20 == 10:
@@ -581,18 +581,18 @@ def pick_video_dialog(start_dir=None):
     root.withdraw()
     root.attributes("-topmost", True)
     path = filedialog.askopenfilename(
-        title="Chọn video để đo", initialdir=start_dir if start_dir and os.path.isdir(start_dir) else None,
-        filetypes=[("Video", "*.mp4 *.mov *.avi *.mkv"), ("Tất cả", "*.*")])
+        title="Choose a video to measure", initialdir=start_dir if start_dir and os.path.isdir(start_dir) else None,
+        filetypes=[("Video", "*.mp4 *.mov *.avi *.mkv"), ("All files", "*.*")])
     root.destroy()
     return path or None
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Tìm bottleneck của pipeline Tennis Analysis")
+    ap = argparse.ArgumentParser(description="Find the bottlenecks of the Tennis Analysis pipeline")
     ap.add_argument("--video", default=None)
-    ap.add_argument("--frames", type=int, default=MEASURE_FRAMES, help="số frame đo sau warmup")
-    ap.add_argument("--ask", action="store_true", help="chọn video bằng hộp thoại")
-    ap.add_argument("--no-sync", action="store_true", help="không đồng bộ CUDA quanh stage")
+    ap.add_argument("--frames", type=int, default=MEASURE_FRAMES, help="number of frames to measure after warmup")
+    ap.add_argument("--ask", action="store_true", help="choose the video with a file dialog")
+    ap.add_argument("--no-sync", action="store_true", help="do not synchronize CUDA around stages")
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -606,7 +606,7 @@ def main():
     video = args.video or (pick_video_dialog(os.path.dirname(config.INPUT_VIDEO)) if args.ask else config.INPUT_VIDEO)
 
     if not video:
-        print("[INFO] Chưa chọn video -> thoát.")
+        print("[INFO] No video selected -> exiting.")
         return
 
     run_pipeline(video, args.frames, sync=SYNC_CUDA and not args.no_sync)

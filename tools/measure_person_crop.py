@@ -1,12 +1,12 @@
 """
-Đo kích thước vùng crop đưa vào model người để chọn PERSON_ENGINE_IMGSZ (h, w).
-Chỉ chạy model sân (không chạy YOLO), và chỉ detect sân ~1 lần / giây video nên khá nhanh.
+Measure the size of the crop fed to the person model to choose PERSON_ENGINE_IMGSZ (h, w).
+Only runs the court model (not YOLO), and detects the court only ~1 time / second of video, so it is fairly fast.
 
-    python measure_person_crop.py [đường_dẫn_video] [số_lần_lấy_mẫu_mỗi_giây]
+    python measure_person_crop.py [video_path] [samples_per_second]
 
-Với engine rộng 1280, scale của người giữ nguyên như engine vuông 1280 khi chiều cao engine
->= 1280 * ch / max(cw, ch). In ra p95 / p99 / max của giá trị đó; chọn p99 (hoặc max nếu muốn
-tuyệt đối không đổi chất lượng).
+With an engine of width 1280, the person scale stays the same as a square 1280 engine when the engine height
+>= 1280 * ch / max(cw, ch). Prints p95 / p99 / max of that value; choose p99 (or max if you want
+absolutely no quality change).
 """
 
 import math
@@ -26,18 +26,18 @@ def main(video, per_second=1.0):
     cap = cv2.VideoCapture(video)
 
     if not cap.isOpened():
-        raise SystemExit(f"Không mở được video: {video}")
+        raise SystemExit(f"Could not open video: {video}")
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
     step = max(1, int(round(fps / per_second)))
 
     model = load_court_model(COURT_MODEL_PATH)
-    print(f"Video {total} frame @ {fps:.1f}fps, lấy mẫu mỗi {step} frame (~{total // step} lần detect)")
+    print(f"Video {total} frames @ {fps:.1f}fps, sampling every {step} frames (~{total // step} detections)")
 
     need, tried, idx, t0 = [], 0, 0, time.time()
 
-    while cap.grab():                       # grab: bỏ qua bước chuyển sang ảnh, rẻ hơn read()
+    while cap.grab():                       # grab: skips the image conversion step, cheaper than read()
         if idx % step == 0:
             ok, frame = cap.retrieve()
 
@@ -51,22 +51,22 @@ def main(video, per_second=1.0):
                     need.append(math.ceil(PERSON_IMGSZ * ch / max(cw, ch) / 32.0) * 32)
 
                 if tried % 10 == 0:
-                    print(f"  frame {idx}/{total} | {len(need)}/{tried} lần thấy sân | {time.time() - t0:.0f}s", flush=True)
+                    print(f"  frame {idx}/{total} | court seen {len(need)}/{tried} times | {time.time() - t0:.0f}s", flush=True)
 
         idx += 1
 
     cap.release()
 
     if not need:
-        raise SystemExit("Không detect được sân ở mẫu nào.")
+        raise SystemExit("Could not detect the court in any sample.")
 
     need = np.array(need)
     p99 = int(np.percentile(need, 99))
 
-    print(f"\n{len(need)}/{tried} mẫu có sân. Chiều cao engine cần: "
+    print(f"\n{len(need)}/{tried} samples with a court. Required engine height: "
           f"p50 {int(np.median(need))} | p95 {int(np.percentile(need, 95))} | p99 {p99} | max {int(need.max())}")
-    print(f"\nKhuyến nghị trong config.py:\n    PERSON_ENGINE_IMGSZ = ({p99}, {PERSON_IMGSZ})")
-    print("Rồi chạy: python export_engines.py (EXPORT_PERSON = True, FORCE = True)")
+    print(f"\nRecommended in config.py:\n    PERSON_ENGINE_IMGSZ = ({p99}, {PERSON_IMGSZ})")
+    print("Then run: python export_engines.py (EXPORT_PERSON = True, FORCE = True)")
 
 
 if __name__ == "__main__":
