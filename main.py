@@ -4,12 +4,12 @@ Tennis Analysis - Inference
 Pipeline: config -> models -> geometry -> court detector/tracker -> player tracker
 -> ball tracker -> bounce detector -> mini-map -> main loop.
 
-Chuyển cảnh (cut / dissolve) được dùng để reset court tracker, ball tracker và bounce detector.
+Scene changes (cut / dissolve) reset the court tracker, ball tracker and bounce detector.
 
-Chạy:
-    python main.py
+Run:
+    python main.py --input path/to/video.mp4
 
-Phím trong cửa sổ preview:  q thoát
+Keys in the preview window:  q to quit
 """
 
 import argparse
@@ -31,7 +31,7 @@ from video_io import ThreadedVideoReader, ThreadedVideoWriter, open_video_io
 
 
 def _reset_scene(court_tracker, ball_tracker, person_tracker, bounce_detector, reset_court=True):
-    """Cảnh mới: bỏ toàn bộ trạng thái của cảnh cũ (reset_court=False khi sân vừa được detect lại)."""
+    """New scene: drop all state of the old scene (reset_court=False when the court was just re-detected)."""
     if reset_court:
         court_tracker.reset()
 
@@ -44,20 +44,20 @@ def _reset_scene(court_tracker, ball_tracker, person_tracker, bounce_detector, r
 
 def process_frame(frame, court_tracker, ball_tracker, person_tracker, scene_cut=None, bounce_detector=None,
                   aux=None):
-    """Chạy toàn bộ pipeline (court, players, ball, mini-map) cho 1 frame.
-    aux: dict tiền xử lý tính sẵn ở thread đọc (xem video_io.make_aux), None thì tự tính."""
+    """Run the whole pipeline (court, players, ball, mini-map) on one frame.
+    aux: dict of preprocessing precomputed in the reader thread (see video_io.make_aux), computed here if None."""
 
     aux = aux or {}
     annotated_frame = frame.copy()
 
-    # 0. Chuyển cảnh theo hình ảnh (cut / dissolve): bỏ sân / vùng tìm bóng / player cũ
+    # 0. Visual scene change (cut / dissolve): drop the old court / ball search region / players
     if scene_cut is not None and scene_cut.update(frame, aux.get("small")):
         _reset_scene(court_tracker, ball_tracker, person_tracker, bounce_detector)
 
     # 1. Court
     court, H = court_tracker.update(frame, aux.get("gray"))
 
-    # 2. Players (đúng 1 người / nửa sân)
+    # 2. Players (exactly 1 person per half)
     players = []
 
     if court is not None:
@@ -68,7 +68,7 @@ def process_frame(frame, court_tracker, ball_tracker, person_tracker, scene_cut=
     # 3. Ball
     ball_point = ball_tracker.detect(frame, annotated_frame)
 
-    # 3b. Chuyển cảnh theo tín hiệu: mất sân + mất bóng + không có player một lúc, hoặc sân xuất hiện lại
+    # 3b. Signal-based scene change: court + ball + players lost for a while, or the court reappears
     event = (scene_cut.update_signals(court is not None, ball_point is not None, len(players) > 0)
              if scene_cut is not None else None)
 
@@ -77,14 +77,14 @@ def process_frame(frame, court_tracker, ball_tracker, person_tracker, scene_cut=
                      reset_court=(event == "lost"))
         ball_point = None
 
-    # 4. Bóng nảy
+    # 4. Ball bounce
     swing_halves = set()
 
     if bounce_detector is not None:
         bounce_detector.update(ball_point, players, H if court is not None else None)
-        swing_halves = bounce_detector.recent_hit_halves()   # cổ tay HOẶC quỹ đạo bóng
+        swing_halves = bounce_detector.recent_hit_halves()   # wrist OR ball trajectory
 
-    # 5. Mini-map (ký hiệu HIT quanh player đang vung vợt)
+    # 5. Mini-map (HIT marker around the player who is swinging)
     if court is not None:
         draw_mini_court(
             annotated_frame, H, players, ball_point,
@@ -92,7 +92,7 @@ def process_frame(frame, court_tracker, ball_tracker, person_tracker, scene_cut=
             swing_halves=swing_halves,
         )
 
-    # 6. Báo chuyển cảnh
+    # 6. Scene change banner
     if scene_cut is not None:
         scene_cut.draw(annotated_frame)
 
@@ -103,11 +103,11 @@ def run(input_video=INPUT_VIDEO, output_video=OUTPUT_VIDEO, show_preview=True,
         models=None, max_frames=None):
     """
     Args:
-        models:     tuple do load_all_models() trả về (truyền vào để tái sử dụng, vd khi benchmark)
-        max_frames: dừng sau N frame (None = chạy hết video)
+        models:     tuple returned by load_all_models() (pass it in to reuse, e.g. when benchmarking)
+        max_frames: stop after N frames (None = run the whole video)
 
     Returns:
-        list thời gian (giây) giữa 2 frame được xử lý liên tiếp.
+        list of times (seconds) between two consecutively processed frames.
     """
 
     if models is None:
@@ -154,7 +154,7 @@ def run(input_video=INPUT_VIDEO, output_video=OUTPUT_VIDEO, show_preview=True,
 
             writer.write(annotated_frame)
 
-            # Preview tốn vài ms/frame (resize 1080p + imshow): chỉ hiện mỗi PREVIEW_EVERY frame
+            # The preview costs a few ms/frame (1080p resize + imshow): only show every PREVIEW_EVERY frames
             if show_preview and len(frame_times) % PREVIEW_EVERY == 0:
                 cv2.imshow("Tennis Analysis", cv2.resize(annotated_frame, None, fx=0.7, fy=0.7))
 
@@ -177,11 +177,12 @@ def run(input_video=INPUT_VIDEO, output_video=OUTPUT_VIDEO, show_preview=True,
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Tennis Analysis: court / player / ball / bounce / swing trên video broadcast")
-    p.add_argument("--input", default=INPUT_VIDEO, help="video đầu vào")
-    p.add_argument("--output", default=None, help="video đầu ra (mặc định: <input>_result.mp4)")
-    p.add_argument("--no-preview", action="store_true", help="không mở cửa sổ preview")
-    p.add_argument("--max-frames", type=int, default=None, help="dừng sau N frame")
+    p = argparse.ArgumentParser(
+        description="Tennis Analysis: court / player / ball / bounce / swing detection on broadcast video")
+    p.add_argument("--input", default=INPUT_VIDEO, help="input video")
+    p.add_argument("--output", default=None, help="output video (default: <input>_result.mp4)")
+    p.add_argument("--no-preview", action="store_true", help="do not open the preview window")
+    p.add_argument("--max-frames", type=int, default=None, help="stop after N frames")
     return p.parse_args()
 
 
