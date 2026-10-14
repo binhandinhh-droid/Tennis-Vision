@@ -1,4 +1,4 @@
-"""Đọc / ghi video trên thread riêng, chạy song song với GPU."""
+"""Read / write video on separate threads, running in parallel with the GPU."""
 
 import queue
 import threading
@@ -10,10 +10,10 @@ from config import IO_QUEUE_SIZE, OPTICAL_FLOW_SCALE
 
 def make_aux(frame):
     """
-    Tiền xử lý CPU cho main loop, tính sẵn ở thread đọc (cv2 nhả GIL nên chạy song song với GPU).
-    Kết quả GIỐNG HỆT lúc scene_cut / court_tracker tự tính:
-        small: frame thu nhỏ 160x90 (SceneCutDetector)
-        gray:  ảnh xám thu nhỏ theo OPTICAL_FLOW_SCALE (CourtTracker, optical flow)
+    CPU preprocessing for the main loop, precomputed in the reader thread (cv2 releases the GIL, so it runs in parallel with the GPU).
+    The result is IDENTICAL to what scene_cut / court_tracker would compute themselves:
+        small: frame downscaled to 160x90 (SceneCutDetector)
+        gray:  grayscale image downscaled by OPTICAL_FLOW_SCALE (CourtTracker, optical flow)
     """
 
     small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
@@ -29,7 +29,7 @@ def make_aux(frame):
 
 
 class ThreadedVideoReader:
-    """Đọc frame trên thread riêng, đẩy vào queue để chạy song song với GPU."""
+    """Read frames on a separate thread and push them into a queue so it runs in parallel with the GPU."""
 
     def __init__(self, cap, queue_size=IO_QUEUE_SIZE, precompute=True):
         self.cap = cap
@@ -61,14 +61,14 @@ class ThreadedVideoReader:
                 if not self._put((frame, aux)):
                     break
         finally:
-            self._put((None, None))   # sentinel: hết video
+            self._put((None, None))   # sentinel: end of video
 
     def read_aux(self):
-        """Trả về (frame, aux) tiếp theo; (None, None) khi hết video."""
+        """Return the next (frame, aux); (None, None) at the end of the video."""
         return self.q.get()
 
     def read(self):
-        """Trả về frame tiếp theo, hoặc None khi hết video (không kèm aux)."""
+        """Return the next frame, or None at the end of the video (without aux)."""
         return self.q.get()[0]
 
     def stop(self):
@@ -77,7 +77,7 @@ class ThreadedVideoReader:
 
 
 class ThreadedVideoWriter:
-    """Encode + ghi video trên thread riêng (mp4v chạy CPU khá tốn)."""
+    """Encode + write video on a separate thread (mp4v runs on the CPU and is fairly expensive)."""
 
     def __init__(self, writer, queue_size=IO_QUEUE_SIZE):
         self.writer = writer
@@ -94,13 +94,13 @@ class ThreadedVideoWriter:
                 break
 
             if self.error is not None:
-                continue   # vẫn rút queue để main thread không bị kẹt
+                continue   # keep draining the queue so the main thread does not get stuck
 
             try:
                 self.writer.write(frame)
             except Exception as e:  # noqa: BLE001
                 self.error = e
-                print(f"[Writer] lỗi ghi video: {e}")
+                print(f"[Writer] video write error: {e}")
 
     def write(self, frame):
         self.q.put(frame)
@@ -116,7 +116,7 @@ def open_video_io(input_video, output_video):
     cap = cv2.VideoCapture(input_video)
 
     if not cap.isOpened():
-        raise RuntimeError(f"Không mở được video: {input_video}")
+        raise RuntimeError(f"Could not open video: {input_video}")
 
     size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
     out = cv2.VideoWriter(output_video, cv2.VideoWriter_fourcc(*"mp4v"), cap.get(cv2.CAP_PROP_FPS), size)

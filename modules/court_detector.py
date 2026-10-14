@@ -1,4 +1,4 @@
-"""Detect sân bằng KeypointRCNN + refine bằng CV cổ điển + kiểm tra kết quả có đúng là sân."""
+"""Court detection with KeypointRCNN + classical CV refinement + validation that the result is really a court."""
 
 import cv2
 import numpy as np
@@ -15,14 +15,14 @@ from geometry import refine_keypoint_by_lines
 
 def _fail(reason):
     if DEBUG_MODE:
-        print(f"[Court] bỏ detect: {reason}")
+        print(f"[Court] detection rejected: {reason}")
     return False
 
 
 def _edge_is_line(gray, a, b):
     """
-    Cạnh a->b có "dạng vạch trắng mảnh" không: điểm mẫu trên cạnh sáng hơn 2 bên (±8px).
-    Returns (n_valid, frac_line); n_valid = số điểm mẫu nằm trong khung hình.
+    Does edge a->b look like a thin white line: sample points on the edge are brighter than both sides (±8px).
+    Returns (n_valid, frac_line); n_valid = number of sample points inside the frame.
     """
 
     h, w = gray.shape
@@ -32,7 +32,7 @@ def _edge_is_line(gray, a, b):
     if length < 20:
         return 0, 0.0
 
-    n = np.array([-d[1], d[0]]) / length   # pháp tuyến đơn vị
+    n = np.array([-d[1], d[0]]) / length   # unit normal
     t = np.linspace(0.1, 0.9, 24)[:, None]
     pts = a + t * d
 
@@ -59,19 +59,19 @@ def _edge_is_line(gray, a, b):
 
 def is_valid_court(frame, keypoints):
     """
-    Bộ 14 keypoint có thật sự là sân tennis không (KeypointRCNN hay "thấy" sân trên mặt người,
-    khán đài...). Kiểm tra độc lập với score:
-      1. 4 góc ngoài (0=TL, 1=TR, 2=BL, 3=BR) tạo tứ giác lồi, đúng thứ tự, diện tích hợp lý
-      2. cạnh xa (trên) không rộng hơn cạnh gần (dưới) - camera truyền hình nhìn từ sau baseline
-      3. các keypoint còn lại nằm trong tứ giác 4 góc
-      4. các cạnh tứ giác trùng với vạch trắng mảnh trên ảnh
+    Is the set of 14 keypoints really a tennis court (KeypointRCNN often "sees" a court on faces,
+    stands...). Checked independently of the score:
+      1. the 4 outer corners (0=TL, 1=TR, 2=BL, 3=BR) form a convex quadrilateral, correctly ordered, with a sensible area
+      2. the far (top) edge is not wider than the near (bottom) edge - broadcast cameras look from behind the baseline
+      3. the remaining keypoints lie inside the 4-corner quadrilateral
+      4. the quadrilateral edges coincide with thin white lines in the image
     """
 
     h, w = frame.shape[:2]
     xy = keypoints[:, :2].astype(np.float64)
     q = np.array([xy[0], xy[1], xy[3], xy[2]])   # TL, TR, BR, BL
 
-    # 1. lồi + đúng thứ tự
+    # 1. convex + correctly ordered
     cross = []
 
     for i in range(4):
@@ -79,30 +79,30 @@ def is_valid_court(frame, keypoints):
         cross.append((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]))
 
     if not all(v > 0 for v in cross):
-        return _fail("4 góc không tạo tứ giác lồi đúng thứ tự")
+        return _fail("4 corners do not form a convex, correctly ordered quadrilateral")
 
     area = 0.5 * abs(sum(q[i][0] * q[(i + 1) % 4][1] - q[(i + 1) % 4][0] * q[i][1] for i in range(4)))
     ratio = area / float(w * h)
 
     if not (COURT_MIN_AREA_RATIO <= ratio <= COURT_MAX_AREA_RATIO):
-        return _fail(f"diện tích tứ giác sân {ratio:.3f} x frame")
+        return _fail(f"court quadrilateral area {ratio:.3f} x frame")
 
-    # 2. cạnh xa không rộng hơn cạnh gần
+    # 2. far edge not wider than near edge
     top_w = np.linalg.norm(q[1] - q[0])
     bot_w = np.linalg.norm(q[2] - q[3])
 
     if top_w > bot_w * 1.2:
-        return _fail("cạnh xa rộng hơn cạnh gần")
+        return _fail("far edge wider than near edge")
 
-    # 3. keypoint còn lại nằm trong tứ giác
+    # 3. remaining keypoints lie inside the quadrilateral
     contour = q.astype(np.float32).reshape(-1, 1, 2)
     tol = COURT_INSIDE_TOL * np.sqrt(area)
     inside = [cv2.pointPolygonTest(contour, (float(p[0]), float(p[1])), True) >= -tol for p in xy[4:]]
 
     if np.mean(inside) < COURT_INSIDE_MIN_RATIO:
-        return _fail(f"chỉ {np.mean(inside):.0%} keypoint nằm trong tứ giác sân")
+        return _fail(f"only {np.mean(inside):.0%} of keypoints lie inside the court quadrilateral")
 
-    # 4. cạnh tứ giác trùng vạch trắng
+    # 4. quadrilateral edges coincide with white lines
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     checked, good = 0, 0
 
@@ -114,21 +114,21 @@ def is_valid_court(frame, keypoints):
             good += frac >= COURT_EDGE_MIN_FRAC
 
     if checked >= 2 and good < min(COURT_EDGE_MIN_GOOD, checked):
-        return _fail(f"chỉ {good}/{checked} cạnh nhìn ra vạch trắng")
+        return _fail(f"only {good}/{checked} edges look like white lines")
 
     return True
 
 
 def detect_court(frame, court_model, min_score=COURT_DETECT_SCORE_THRESH):
     """
-    KeypointRCNN lấy 14 keypoint sân, refine từng điểm bằng CV cổ điển, rồi kiểm tra có đúng là sân.
+    KeypointRCNN gets the 14 court keypoints, each is refined with classical CV, then validated as a real court.
 
     Returns:
-        (box, keypoints, score) hoặc None.
+        (box, keypoints, score) or None.
     """
 
     tensor = F.to_tensor(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    tensor = tensor.to(DEVICE, next(court_model.parameters()).dtype)   # model FP16 -> input FP16
+    tensor = tensor.to(DEVICE, next(court_model.parameters()).dtype)   # FP16 model -> FP16 input
 
     with torch.no_grad():
         prediction = court_model([tensor])[0]
@@ -157,7 +157,7 @@ def detect_court(frame, court_model, min_score=COURT_DETECT_SCORE_THRESH):
 
 
 def draw_court(img, court):
-    """Vẽ box (nếu debug) + luôn đánh số thứ tự từng keypoint."""
+    """Draw the box (if debugging) + always number each keypoint."""
 
     box, keypoints, score = court
 

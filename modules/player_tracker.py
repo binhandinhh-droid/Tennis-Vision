@@ -1,9 +1,9 @@
-"""Track người chơi: YOLO-pose trên vùng quanh sân + PlayerMemory giữ đúng 1 player mỗi nửa sân.
+"""Player tracking: YOLO-pose on the area around the court + PlayerMemory keeping exactly 1 player per half.
 
-Không dùng ByteTrack của ultralytics nữa (id đổi / mất khi bị che làm player "biến mất").
-Mỗi frame chỉ lấy detection thô, PlayerMemory tự nối người giữa các frame theo vị trí:
-  - hụt detection -> giữ vị trí cũ tối đa PLAYER_COAST_FRAMES frame (coast)
-  - người khác chỉ thay thế khi tốt hơn hẳn liên tục PLAYER_SWITCH_FRAMES frame
+Ultralytics' ByteTrack is no longer used (ids change / get lost under occlusion, making players "disappear").
+Each frame only takes raw detections; PlayerMemory links people across frames by position:
+  - detection missed -> keep the old position for at most PLAYER_COAST_FRAMES frames (coast)
+  - another person only replaces the tracked one when clearly better for PLAYER_SWITCH_FRAMES consecutive frames
 """
 
 import cv2
@@ -22,12 +22,12 @@ HALVES = ("Player 1", "Player 2")
 
 def classify_player(foot_point, H):
     """
-    Chiếu foot_point qua H rồi phân loại + lọc theo margin thật (mét).
+    Project foot_point through H, then classify + filter by the real margin (meters).
 
     Returns:
-        (label, priority) hoặc None nếu nằm ngoài vùng hợp lệ.
-        label    = "Player 1" (nửa dưới) / "Player 2" (nửa trên)
-        priority = 0 nếu nằm trong biên sân, càng âm càng xa biên.
+        (label, priority) or None if outside the valid area.
+        label    = "Player 1" (lower half) / "Player 2" (upper half)
+        priority = 0 if inside the court lines, more negative the farther outside.
     """
 
     proj = project_point(H, foot_point)
@@ -52,7 +52,7 @@ def classify_player(foot_point, H):
 
 
 def build_candidates(xyxy, confs, kpts, H):
-    """Gom detection thành {half: [candidate,...]} (đã lọc theo vùng hợp lệ, xếp tốt nhất trước)."""
+    """Group detections into {half: [candidate,...]} (filtered by the valid area, best first)."""
 
     cands = {h: [] for h in HALVES}
 
@@ -69,13 +69,13 @@ def build_candidates(xyxy, confs, kpts, H):
 
         cands[label].append({
             "label": label,
-            "half": label,   # nửa sân (Player 1 = gần camera)
+            "half": label,   # court half (Player 1 = nearest the camera)
             "point": foot_point,
             "box": (x1, y1, x2, y2),
             "id": None,
             "conf": float(confs[i]),
             "rank": (priority, max(0, x2 - x1) * max(0, y2 - y1)),
-            "kpts": kpts[i] if kpts is not None else None,   # (17, 3) toạ độ frame gốc
+            "kpts": kpts[i] if kpts is not None else None,   # (17, 3) in original frame coordinates
             "coasted": False,
         })
 
@@ -86,7 +86,7 @@ def build_candidates(xyxy, confs, kpts, H):
 
 
 class PlayerMemory:
-    """Giữ ổn định đúng 1 player mỗi nửa sân qua các frame."""
+    """Keeps exactly 1 stable player per court half across frames."""
 
     def __init__(self):
         self.state = {}   # half -> {"player", "miss", "challenger"}
@@ -107,7 +107,7 @@ class PlayerMemory:
 
     @staticmethod
     def _match(prev, miss, cands):
-        """Candidate gần prev nhất, trong bán kính tính theo chiều cao box (nở dần khi hụt lâu)."""
+        """Candidate closest to prev, within a radius based on box height (grows as the miss gets longer)."""
 
         px1, py1, px2, py2 = prev["box"]
         pc = ((px1 + px2) / 2.0, (py1 + py2) / 2.0)
@@ -140,7 +140,7 @@ class PlayerMemory:
         if matched is not None:
             st["miss"] = 0
 
-            # Người khác tốt hơn hẳn (gần sân hơn) liên tục N frame mới thay
+            # Someone else clearly better (closer to the court) for N consecutive frames before replacing
             if (best is not None and best is not matched
                     and best["rank"][0] - matched["rank"][0] >= PLAYER_SWITCH_PRIORITY_GAP):
                 st["challenger"] += 1
@@ -154,7 +154,7 @@ class PlayerMemory:
             st["player"] = matched
             return matched
 
-        # Không khớp: coast vị trí cũ
+        # No match: coast on the old position
         st["miss"] += 1
         st["challenger"] = 0
 
@@ -167,7 +167,7 @@ class PlayerMemory:
             return best
 
         coast = dict(st["player"])
-        coast["kpts"] = None       # không có keypoint mới
+        coast["kpts"] = None       # no new keypoints
         coast["coasted"] = True
         st["player"] = coast
         return coast
@@ -180,9 +180,9 @@ def _is_fixed_shape(model):
 
 def _crop_around_court(frame, court_box):
     """
-    Crop vùng quanh sân (+ margin để vẫn thấy người đứng sau baseline) đưa vào YOLO
-    thay cho cả frame. Trả về (source, x_off, y_off); không crop nếu vùng crop
-    quá nhỏ hoặc không nhỏ hơn hẳn cả frame.
+    Crop the area around the court (+ margin so people standing behind the baseline are still visible) and feed it to YOLO
+    instead of the whole frame. Returns (source, x_off, y_off); no crop if the crop area
+    is too small or not clearly smaller than the whole frame.
     """
 
     h, w = frame.shape[:2]
@@ -204,7 +204,7 @@ def _crop_around_court(frame, court_box):
 
 
 class PlayerTracker:
-    """YOLO-pose (predict, không ByteTrack) + PlayerMemory."""
+    """YOLO-pose (predict, no ByteTrack) + PlayerMemory."""
 
     def __init__(self, person_model):
         self.model = person_model
@@ -212,11 +212,11 @@ class PlayerTracker:
         self.memory = PlayerMemory()
 
     def reset(self):
-        """Chuyển cảnh: bỏ người đang theo dõi."""
+        """Scene change: drop the tracked people."""
         self.memory.reset()
 
     def update(self, frame, H, court_box):
-        """Returns list {"point", "label", "half", "box", "kpts", "coasted", ...} (đúng ≤1 người / nửa sân)."""
+        """Returns a list of {"point", "label", "half", "box", "kpts", "coasted", ...} (at most 1 person per half)."""
 
         source, x_off, y_off = _crop_around_court(frame, court_box)
 
@@ -232,7 +232,7 @@ class PlayerTracker:
         xyxy[:, [0, 2]] += x_off
         xyxy[:, [1, 3]] += y_off
 
-        # Keypoint (chỉ có khi dùng model pose); đưa về toạ độ frame gốc như box
+        # Keypoints (only with a pose model); mapped back to original frame coordinates like the boxes
         kpts = None
 
         if res.keypoints is not None and res.keypoints.data.numel() > 0 and len(boxes) > 0:
@@ -261,7 +261,7 @@ def _draw_player(img, player):
 
 
 def draw_players(img, players):
-    """Vẽ box + nhãn từng player ."""
+    """Draw the box + label of each player."""
 
     for p in players:
         _draw_player(img, p)

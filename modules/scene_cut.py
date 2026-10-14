@@ -1,4 +1,4 @@
-"""Phát hiện chuyển cảnh (cut / dissolve)."""
+"""Scene change detection (cut / dissolve)."""
 
 from collections import deque
 
@@ -13,11 +13,11 @@ from config import (
 
 class SceneCutDetector:
     """
-    Phát hiện chuyển cảnh giữa 2 frame liên tiếp: histogram HSV (thu nhỏ) lệch mạnh
-    hoặc ảnh xám thay đổi mạnh (cắt cứng).
-    Thêm 1 phép so với frame cách SCENE_CUT_WINDOW frame để bắt chuyển cảnh mờ dần (dissolve / wipe),
-    vì mỗi cặp frame liên tiếp của dissolve chỉ khác nhau rất ít.
-    Camera pan / zoom trong cùng 1 cảnh thì đổi từ từ nên không bị tính.
+    Detects a scene change between two consecutive frames: the (downscaled) HSV histogram shifts strongly
+    or the grayscale image changes strongly (hard cut).
+    Plus one comparison against the frame SCENE_CUT_WINDOW frames back to catch gradual transitions (dissolve / wipe),
+    since each pair of consecutive frames in a dissolve differs only slightly.
+    Camera pan / zoom within the same scene changes slowly, so it is not counted.
     """
 
     def __init__(self):
@@ -26,8 +26,8 @@ class SceneCutDetector:
         self.since_cut = 10 ** 9
 
     def update(self, frame, small=None):
-        """Returns True nếu frame này là frame đầu tiên của một cảnh mới.
-        small: frame đã thu nhỏ 160x90 (tính sẵn ở thread đọc); None thì tự tính."""
+        """Returns True if this frame is the first frame of a new scene.
+        small: frame already downscaled to 160x90 (precomputed in the reader thread); computed here if None."""
 
         if small is None:
             small = cv2.resize(frame, (160, 90), interpolation=cv2.INTER_AREA)
@@ -45,7 +45,7 @@ class SceneCutDetector:
             mad = float(np.abs(gray - self.prev_gray).mean())
             cut = corr < SCENE_CUT_HIST_CORR or mad > SCENE_CUT_MAD
 
-            # Chuyển cảnh mờ dần: so với frame cách SCENE_CUT_WINDOW frame (và chưa vừa báo cut)
+            # Gradual transition: compare with the frame SCENE_CUT_WINDOW frames back (and no cut was just reported)
             if (not cut and len(self.hists) == self.hists.maxlen
                     and self.since_cut > SCENE_CUT_WINDOW):
                 corr_w = cv2.compareHist(self.hists[0], hist, cv2.HISTCMP_CORREL)
@@ -67,11 +67,11 @@ class SceneCutDetector:
 
 class SceneMonitor(SceneCutDetector):
     """
-    Chuyển cảnh = histogram/ảnh đổi mạnh (SceneCutDetector)  HOẶC  mất tín hiệu sân:
-        không có sân (detect sân độ tin cậy thấp / mất track) liên tục SCENE_LOST_S giây
-        VÀ gần như không thấy bóng trong khoảng đó VÀ không có player  -> "lost"
-    Khi sân xuất hiện lại sau "lost" -> "back" (cũng là chuyển cảnh).
-    Mỗi lần chuyển cảnh hiện chữ "SCENE CHANGE" trên màn hình SCENE_BANNER_S giây.
+    Scene change = strong histogram/image change (SceneCutDetector)  OR  loss of the court signal:
+        no court (low-confidence court detection / lost track) for SCENE_LOST_S seconds in a row
+        AND the ball is almost never seen in that period AND there are no players  -> "lost"
+    When the court reappears after "lost" -> "back" (also a scene change).
+    On every scene change the text "SCENE CHANGE" is shown on screen for SCENE_BANNER_S seconds.
     """
 
     def __init__(self, fps):
@@ -87,11 +87,11 @@ class SceneMonitor(SceneCutDetector):
         self.banner_left = 0
 
     def _trigger(self):
-        if self.banner_left == 0:   # đang hiện banner của lần chuyển cảnh trước thì không đếm lại
+        if self.banner_left == 0:   # a banner from the previous scene change is still showing: do not restart it
             self.banner_left = self.banner_frames
 
     def update(self, frame, small=None):
-        """Chuyển cảnh theo hình ảnh. Returns True nếu frame này là frame đầu của cảnh mới."""
+        """Visual scene change. Returns True if this frame is the first frame of a new scene."""
 
         cut = super().update(frame, small)
 
@@ -103,7 +103,7 @@ class SceneMonitor(SceneCutDetector):
         return cut
 
     def update_signals(self, court_found, ball_found, players_found):
-        """Gọi mỗi frame sau khi đã chạy court / players / ball. Returns None | "lost" | "back"."""
+        """Call every frame after court / players / ball have run. Returns None | "lost" | "back"."""
 
         self.court_miss = 0 if court_found else self.court_miss + 1
         self.ball_hist.append(bool(ball_found))
@@ -117,7 +117,7 @@ class SceneMonitor(SceneCutDetector):
                 self._trigger()
 
                 if DEBUG_MODE:
-                    print("[Scene] mất sân + mất bóng -> chuyển sang cảnh không phải sân")
+                    print("[Scene] court lost + ball lost -> switched to a non-court scene")
 
                 return "lost"
 
@@ -127,14 +127,14 @@ class SceneMonitor(SceneCutDetector):
             self._trigger()
 
             if DEBUG_MODE:
-                print("[Scene] thấy sân lại -> cảnh mới")
+                print("[Scene] court seen again -> new scene")
 
             return "back"
 
         return None
 
     def draw(self, img):
-        """Vẽ chữ SCENE CHANGE ở giữa phía trên frame trong banner_frames frame."""
+        """Draw the SCENE CHANGE text at the top center of the frame for banner_frames frames."""
 
         if self.banner_left <= 0:
             return

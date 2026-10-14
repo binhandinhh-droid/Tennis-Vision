@@ -1,4 +1,4 @@
-"""Track bóng: local search quanh vị trí cũ, fallback quét toàn frame."""
+"""Ball tracking: local search around the previous position, fallback to a full-frame scan."""
 
 import cv2
 import numpy as np
@@ -11,15 +11,15 @@ from config import (
 
 
 def _is_fixed_shape(model):
-    """Engine TensorRT có shape cố định lúc export: không truyền imgsz lúc predict."""
+    """TensorRT engines have a fixed shape set at export time: do not pass imgsz at predict time."""
     name = str(getattr(model, "model_name", "") or getattr(model, "ckpt_path", "") or "")
     return name.lower().endswith(".engine")
 
 
 def _roi_imgsz(roi_w, roi_h, frame_w):
     """
-    imgsz cho ROI để bóng có cùng kích thước pixel như lúc train:
-    lúc train, ảnh full-frame bị resize với tỉ lệ BALL_TRAIN_IMGSZ / frame_w -> áp cùng tỉ lệ cho ROI.
+    imgsz for the ROI so the ball has the same pixel size as during training:
+    at training time a full-frame image is resized by BALL_TRAIN_IMGSZ / frame_w -> apply the same ratio to the ROI.
     """
     scale = BALL_TRAIN_IMGSZ / float(frame_w)
     size = int(np.ceil(max(roi_w, roi_h) * scale / 32.0) * 32)
@@ -32,38 +32,38 @@ class BallTracker:
 
         self.ball_model = ball_model
 
-        # Model nhỏ (engine imgsz thấp) chuyên cho vùng ROI; không có thì dùng chung model global.
+        # Small model (low-imgsz engine) dedicated to the ROI; if absent, share the global model.
         self.local_model = local_model if local_model is not None else ball_model
 
-        # Engine shape cố định thì imgsz đã nằm trong lúc export; còn model .pt thì tính imgsz theo ROI.
+        # A fixed-shape engine already has imgsz baked in at export; a .pt model computes imgsz from the ROI.
         self._dynamic_imgsz = not _is_fixed_shape(self.local_model)
 
-        # Giữ vùng tìm kiếm cũ vài frame sau khi mất bóng - CHỈ có ý nghĩa khi local
-        # search rẻ (có local model riêng); dùng chung model thì patience = 0.
+        # Keep the old search region for a few frames after losing the ball - ONLY meaningful when the
+        # local search is cheap (a dedicated local model); with a shared model patience = 0.
         self.lost_patience = BALL_LOST_PATIENCE if local_model is not None else 0
         self.lost_frames = 0
 
         self.last_ball_box = None
 
     def reset(self):
-        """Chuyển cảnh: bỏ vùng tìm kiếm cũ."""
+        """Scene change: drop the old search region."""
         self.last_ball_box = None
         self.lost_frames = 0
 
     def detect(self, frame, annotated_frame):
-        """Returns: (cx, cy) hoặc None nếu không thấy bóng."""
+        """Returns: (cx, cy), or None if the ball is not seen."""
 
         height, width = frame.shape[:2]
 
         result = None
         offset_x, offset_y = 0, 0
 
-        # ---- Local search quanh vị trí cuối cùng thấy bóng ----
+        # ---- Local search around the last position where the ball was seen ----
         if self.last_ball_box is not None:
 
             lx1, ly1, lx2, ly2 = self.last_ball_box
 
-            # Mất bóng càng lâu thì vùng tìm càng rộng (có trần để bóng không bị co quá nhỏ khi resize)
+            # The longer the ball is lost, the wider the search region (capped so the ball does not shrink too much when resized)
             margin = int(BALL_SEARCH_MARGIN * (1.0 + BALL_SEARCH_GROWTH * self.lost_frames))
             margin = min(margin, max(BALL_SEARCH_MARGIN, BALL_LOCAL_MAX_MARGIN))
 
@@ -95,7 +95,7 @@ class BallTracker:
             if len(global_.boxes) > 0:
                 result = global_
 
-        # ---- Không thấy bóng ----
+        # ---- Ball not found ----
         if result is None:
             if self.last_ball_box is not None:
                 self.lost_frames += 1

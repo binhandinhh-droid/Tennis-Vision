@@ -1,4 +1,4 @@
-"""Mini-map sân tennis (top-down) vẽ ở góc trên bên phải frame."""
+"""Tennis court mini-map (top-down) drawn in the top-right corner of the frame."""
 
 import cv2
 import numpy as np
@@ -14,7 +14,7 @@ _MINI_CANVAS_H = MINI_COURT_H + MINI_PADDING * 2
 
 
 def _build_mini_court_base():
-    """Nền mini-map tĩnh (khung sân, biên đơn, vạch giao bóng, đường giữa, lưới) - vẽ 1 lần."""
+    """Static mini-map background (court outline, singles sidelines, service lines, center line, net) - drawn once."""
 
     canvas = np.full((_MINI_CANVAS_H, _MINI_CANVAS_W, 3), (25, 25, 25), dtype=np.uint8)
 
@@ -47,7 +47,7 @@ _MINI_COURT_BASE = _build_mini_court_base()
 
 
 def _blit_canvas(frame, canvas):
-    """Ghép canvas mini-map lên góc trên bên phải của frame."""
+    """Paste the mini-map canvas onto the top-right corner of the frame."""
 
     x_off = frame.shape[1] - _MINI_CANVAS_W - MINI_MARGIN_RIGHT
     y_off = MINI_MARGIN_TOP
@@ -67,14 +67,14 @@ def _blit_canvas(frame, canvas):
 
 def draw_mini_court(frame, H, players, ball_point, marks=None, swing_halves=None):
     """
-    Vẽ mini-map sân tennis (top-down) ở góc trên bên phải frame.
+    Draw the tennis court mini-map (top-down) in the top-right corner of the frame.
 
     Args:
-        H:          homography của frame hiện tại
-        players:    list dict {"point": (x, y), "label": "Player 1"/"Player 2", ...}
-        ball_point: (x, y) tâm bóng trên frame gốc, hoặc None
-        swing_halves: tập half ("Player 1"/"Player 2") đang vung vợt: vẽ vòng đỏ + chữ HIT quanh chấm player
-        marks:      list (x, y) điểm bóng nảy gần đây (toạ độ mini-map), vẽ dấu X; hoặc None
+        H:          homography of the current frame
+        players:    list of dicts {"point": (x, y), "label": "Player 1"/"Player 2", ...}
+        ball_point: (x, y) ball center on the original frame, or None
+        swing_halves: set of halves ("Player 1"/"Player 2") that are swinging: draw a red ring + "HIT" text around the player dot
+        marks:      list of (x, y) recent bounce points (mini-map coordinates), drawn as X marks; or None
     """
 
     canvas = _MINI_COURT_BASE.copy()
@@ -112,7 +112,7 @@ def draw_mini_court(frame, H, players, ball_point, marks=None, swing_halves=None
         if proj is not None:
             bx, by = proj
 
-            # Chỉ vẽ nếu bóng nằm gần sân (cho phép bay ra ngoài biên một chút)
+            # Only draw if the ball is near the court (allow it to fly slightly outside the lines)
             if -30 <= bx <= MINI_COURT_W + 30 and -30 <= by <= MINI_COURT_H + 30:
                 bx = int(np.clip(bx, 0, MINI_COURT_W))
                 by = int(np.clip(by, 0, MINI_COURT_H))

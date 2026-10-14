@@ -1,4 +1,4 @@
-"""Phát hiện cú vung vợt từ keypoint cổ tay của player (YOLO-pose)."""
+"""Racket swing detection from the players' wrist keypoints (YOLO-pose)."""
 
 from collections import deque
 
@@ -14,28 +14,28 @@ from config import (
 
 class SwingDetector:
     """
-    Bằng chứng về cú vung vợt từ chuyển động cổ tay SO VỚI THÂN (tâm vai + hông):
-      - camera pan / zoom, người chạy hay nhảy làm cả thân lẫn cổ tay dịch cùng nhau nên không tính là vung;
-      - tốc độ tính bằng chiều cao người / giây (không phụ thuộc khoảng cách camera và fps),
-        đo trên SWING_SPEED_SPAN frame để keypoint rung vài px không bị tính;
-      - tốc độ phi thực tế (> SWING_MAX_SPEED_H_PER_S: keypoint nhảy, đảo trái/phải) bị bỏ;
-      - phải nhanh liên tiếp >= SWING_MIN_FRAMES frame, nhiễu 1 frame không đủ.
+    Evidence of a racket swing from wrist motion RELATIVE TO THE TORSO (shoulder + hip center):
+      - camera pan / zoom, or a person running / jumping, moves the torso and wrists together, so it does not count as a swing;
+      - speed is measured in person heights / second (independent of camera distance and fps),
+        over SWING_SPEED_SPAN frames so a few px of keypoint jitter is not counted;
+      - unrealistic speeds (> SWING_MAX_SPEED_H_PER_S: keypoint jumps, left/right flips) are discarded;
+      - the wrist must be fast for >= SWING_MIN_FRAMES consecutive frames; 1-frame noise is not enough.
 
-    `swing_state` (dùng lọc bóng nảy) trả về 3 trạng thái:
-        True   cổ tay vung nhanh VÀ sát bóng       -> chắc chắn là cú đánh
-        False  cổ tay ở gần bóng, nhìn rõ, đang di chuyển chậm -> chắc chắn KHÔNG phải cú đánh
-        None   không đủ thông tin (không thấy cổ tay / thân, hoặc tốc độ lưng chừng)
+    `swing_state` (used to filter bounces) returns 3 states:
+        True   wrist swinging fast AND close to the ball  -> definitely a hit
+        False  wrist near the ball, clearly visible, moving slowly -> definitely NOT a hit
+        None   not enough information (wrist / torso not visible, or speed in between)
 
-    `recent_swings` (dùng hiển thị) báo vung ngay ở frame hiện tại, không cần bóng.
+    `recent_swings` (used for display) reports a swing right at the current frame, without needing the ball.
     """
 
     def __init__(self, fps):
         self.fps = fps if fps and fps > 0 else 30.0
         self.tol = max(1, int(round(SWING_TOL_S * self.fps)))
         self.hist = {}      # half -> deque[(frame_idx, wrists_abs (2,2), wrists_rel (2,2), h)]
-        self.streak = {}    # half -> (frame_idx cuối, số frame nhanh liên tiếp)
+        self.streak = {}    # half -> (last frame_idx, number of consecutive fast frames)
 
-        # Hiển thị tín hiệu vung: half -> (frame_idx, toạ độ cổ tay, box player) của lần vung gần nhất
+        # Swing display: half -> (frame_idx, wrist coordinates, player box) of the most recent swing
         self.show_frames = max(1, int(round(SWING_SHOW_S * self.fps)))
         self.last_swing = {}
 
@@ -44,11 +44,11 @@ class SwingDetector:
         self.streak.clear()
         self.last_swing.clear()
 
-    # ------------------------------------------------------------------ ghi nhận
+    # ------------------------------------------------------------------ recording
 
     @staticmethod
     def _extract(kp):
-        """(wrists_abs (2,2), wrists_rel (2,2)). rel = cổ tay - tâm thân; NaN nếu thiếu keypoint."""
+        """(wrists_abs (2,2), wrists_rel (2,2)). rel = wrist - torso center; NaN if a keypoint is missing."""
 
         wr = np.full((2, 2), np.nan, dtype=np.float32)
 
@@ -66,7 +66,7 @@ class SwingDetector:
         return wr, rel
 
     def update(self, frame_idx, players):
-        """Gọi mỗi frame (kể cả khi không thấy bóng) để lịch sử cổ tay liên tục."""
+        """Call every frame (even when the ball is not seen) to keep the wrist history continuous."""
 
         for p in players:
             kp = p.get("kpts")
@@ -86,13 +86,13 @@ class SwingDetector:
 
     def _speeds_at(self, by_frame, f, h):
         """
-        Tốc độ cổ tay so với thân tại frame f (chiều cao người / giây), shape (2,).
-        NaN nếu thiếu mẫu / không thấy cổ tay hoặc thân / vượt SWING_MAX_SPEED_H_PER_S.
+        Wrist speed relative to the torso at frame f (person heights / second), shape (2,).
+        NaN if samples are missing / wrist or torso not visible / above SWING_MAX_SPEED_H_PER_S.
         """
 
         rel = by_frame[f][1]
 
-        for span in range(SWING_SPEED_SPAN, 0, -1):   # thiếu mẫu thì thử khoảng ngắn hơn
+        for span in range(SWING_SPEED_SPAN, 0, -1):   # if samples are missing, try a shorter span
             if f - span in by_frame:
                 with np.errstate(invalid="ignore"):
                     speeds = np.linalg.norm(rel - by_frame[f - span][1], axis=1) / span / h * self.fps
@@ -103,7 +103,7 @@ class SwingDetector:
         return np.full(2, np.nan, dtype=np.float32)
 
     def _mark_swing(self, player, dq, frame_idx, h):
-        """Báo vung NGAY ở frame hiện tại (không chờ các frame sau, không cần bóng)."""
+        """Report a swing RIGHT at the current frame (do not wait for later frames, no ball needed)."""
 
         by_frame = {f: (wr, rel) for f, wr, rel, _ in dq}
         speeds = self._speeds_at(by_frame, frame_idx, h)
@@ -122,13 +122,13 @@ class SwingDetector:
         self.streak[half] = (frame_idx, count)
 
         if count >= SWING_MIN_FRAMES:
-            j = int(np.nanargmax(speeds))   # cổ tay nhanh nhất = tay cầm vợt
+            j = int(np.nanargmax(speeds))   # fastest wrist = the racket hand
             self.last_swing[half] = (frame_idx, by_frame[frame_idx][0][j].copy(), player["box"])
 
-    # ------------------------------------------------------------------ truy vấn
+    # ------------------------------------------------------------------ queries
 
     def recent_swings(self, frame_idx):
-        """List (half, toạ độ cổ tay, box) của các cú vung còn trong thời gian hiển thị SWING_SHOW_S."""
+        """List of (half, wrist coordinates, box) for swings still within the SWING_SHOW_S display time."""
 
         self.last_swing = {
             half: s for half, s in self.last_swing.items() if frame_idx - s[0] <= self.show_frames
@@ -137,7 +137,7 @@ class SwingDetector:
         return [(half, s[1], s[2]) for half, s in self.last_swing.items()]
 
     def _wrist_speeds(self, dq, frame_idx):
-        """Với mỗi frame f quanh frame_idx: (f, wrists_abs, h, speeds (2,))."""
+        """For each frame f around frame_idx: (f, wrists_abs, h, speeds (2,))."""
 
         by_frame = {f: (wr, rel) for f, wr, rel, _ in dq}
         heights = {f: h for f, _, _, h in dq}
@@ -150,20 +150,20 @@ class SwingDetector:
         return out
 
     def _scan(self, frame_idx, ball_pt):
-        """half -> (fast_near, seen_slow, seen_mid) quanh frame_idx. Xem swing_state."""
+        """half -> (fast_near, seen_slow, seen_mid) around frame_idx. See swing_state."""
 
         ball = np.asarray(ball_pt, dtype=np.float32)
         out = {}
 
         for half, dq in self.hist.items():
-            fast_near = 0   # số frame có cổ tay nhanh VÀ sát bóng
-            seen_slow = 0   # số mẫu cổ tay GẦN bóng, nhìn rõ và chậm
-            seen_mid = 0    # số mẫu gần bóng nhưng tốc độ lưng chừng
+            fast_near = 0   # number of frames with a wrist that is fast AND close to the ball
+            seen_slow = 0   # number of wrist samples CLOSE to the ball, clearly visible and slow
+            seen_mid = 0    # number of samples near the ball but with in-between speed
 
             for _, wr, h, speeds in self._wrist_speeds(dq, frame_idx):
 
                 with np.errstate(invalid="ignore"):
-                    dist = np.linalg.norm(wr - ball, axis=1) / h   # NaN -> mọi so sánh đều False
+                    dist = np.linalg.norm(wr - ball, axis=1) / h   # NaN -> every comparison is False
 
                     if np.any((speeds >= SWING_SPEED_H_PER_S) & (dist <= SWING_BALL_DIST_H)):
                         fast_near += 1
@@ -181,7 +181,7 @@ class SwingDetector:
         return out
 
     def swing_state(self, frame_idx, ball_pt):
-        """True / False / None, xem docstring của lớp."""
+        """True / False / None, see the class docstring."""
 
         scan = self._scan(frame_idx, ball_pt)
 
@@ -192,14 +192,14 @@ class SwingDetector:
         if fast_near >= min(SWING_MIN_FRAMES, 2 * self.tol + 1):
             return True
 
-        # Phải thấy chậm ở >= 2 mẫu và không có mẫu nào lưng chừng mới dám khẳng định "không vung"
+        # Must see slow motion in >= 2 samples and no in-between sample before daring to assert "no swing"
         if seen_slow >= 2 and seen_mid == 0:
             return False
 
         return None
 
     def swing_hitter(self, frame_idx, ball_pt):
-        """Half của người đang vung vợt sát bóng (cổ tay nhanh, gần bóng) tại frame_idx, hoặc None."""
+        """Half of the person swinging near the ball (wrist fast, close to the ball) at frame_idx, or None."""
 
         need = min(SWING_MIN_FRAMES, 2 * self.tol + 1)
         best = None
@@ -211,5 +211,5 @@ class SwingDetector:
         return best[0] if best else None
 
     def swing_near_ball(self, frame_idx, ball_pt):
-        """Tương thích cũ: True nếu chắc chắn có cú vung sát bóng."""
+        """Backward compatible: True if there is definitely a swing near the ball."""
         return self.swing_state(frame_idx, ball_pt) is True

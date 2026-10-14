@@ -1,4 +1,4 @@
-"""Hình học: giao điểm line, refine keypoint sân, homography frame -> mini-map."""
+"""Geometry: line intersection, court keypoint refinement, frame -> mini-map homography."""
 
 import cv2
 import numpy as np
@@ -26,7 +26,7 @@ def line_intersection(p1, p2, p3, p4):
 
 
 def _weighted_avg_line(candidates):
-    """Trung bình có trọng số (theo độ dài) của các line cùng hướng."""
+    """Length-weighted average of lines with the same orientation."""
 
     total_len = sum(ln for _, ln in candidates)
     return tuple(
@@ -35,7 +35,7 @@ def _weighted_avg_line(candidates):
 
 
 def refine_keypoint_by_lines(frame, pt):
-    """Kéo keypoint dính vào giao điểm của 2 đường kẻ trắng gần nhất."""
+    """Snap a keypoint to the intersection of the 2 nearest white lines."""
 
     h, w = frame.shape[:2]
     x, y = pt
@@ -47,12 +47,12 @@ def refine_keypoint_by_lines(frame, pt):
 
     crop = frame[y0:y1c, x0:x1c]
 
-    if crop.size == 0:   # keypoint nằm ngoài khung hình
+    if crop.size == 0:   # keypoint is outside the frame
         return pt
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
-    # Threshold thích nghi theo percentile sáng nhất trong vùng crop
+    # Adaptive threshold based on the brightest percentile inside the crop
     local_thresh = max(REFINE_WHITE_THRESH, np.percentile(gray, 85))
     _, mask = cv2.threshold(gray, local_thresh, 255, cv2.THRESH_BINARY)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
@@ -96,7 +96,7 @@ def refine_keypoint_by_lines(frame, pt):
 
     refined = (x0 + ix, y0 + iy)
 
-    # Dịch quá xa so với dự đoán gốc -> khả năng bắt nhầm line, giữ điểm gốc
+    # Shifted too far from the original prediction -> probably picked up the wrong line, keep the original point
     if np.hypot(refined[0] - x, refined[1] - y) > REFINE_MAX_SHIFT:
         return pt
 
@@ -104,7 +104,7 @@ def refine_keypoint_by_lines(frame, pt):
 
 
 def compute_court_homography(keypoints):
-    """Homography từ 4 góc sân trên frame sang mini-map. Model: 0=TL, 1=TR, 2=BL, 3=BR."""
+    """Homography from the 4 court corners on the frame to the mini-map. Model: 0=TL, 1=TR, 2=BL, 3=BR."""
 
     src = np.array([
         keypoints[0][:2],  # top-left
@@ -117,7 +117,7 @@ def compute_court_homography(keypoints):
 
 
 def project_point(H, pt):
-    """Chiếu 1 điểm (x, y) trên frame gốc qua homography H."""
+    """Project a point (x, y) on the original frame through homography H."""
 
     res = H @ np.array([pt[0], pt[1], 1.0], dtype=np.float32)
 

@@ -1,4 +1,4 @@
-"""Phát hiện điểm bóng nảy trên sân từ quỹ đạo bóng, trả về toạ độ trên mini-map."""
+"""Detect ball bounce points on the court from the ball trajectory; returns mini-map coordinates."""
 
 from collections import deque
 
@@ -19,21 +19,21 @@ from swing_detector import SwingDetector
 
 
 def _half_of(y):
-    """Nửa sân chứa điểm mini-map có toạ độ y. Cùng nhãn với player đứng ở nửa đó."""
+    """Court half containing the mini-map point with coordinate y. Same label as the player standing in that half."""
     return "Player 2" if y < MINI_COURT_H / 2.0 else "Player 1"
 
 
 class BounceDetector:
     """
-    Điểm nảy = đáy quỹ đạo (hoặc xung giảm vy) của cửa sổ 2k+1 mẫu bóng liên tiếp.
-    Sau đó ứng viên phải qua các luật loại "cú đánh" (kết quả trễ k mẫu so với frame thật):
+    Bounce point = trajectory bottom (or vy-drop impulse) of a window of 2k+1 consecutive ball samples.
+    The candidate then has to pass the rules that reject "hits" (the result lags the real frame by k samples):
 
-      L1  Trong tầm vợt, cao hơn chân: keypoint cổ tay / quỹ đạo quyết định (như cũ).
-      L2  Sổ cú đánh (hit events): mỗi khi cổ tay nhanh sát bóng (hoặc L1 kết luận cú đánh)
-          ghi lại (frame, nửa sân người đánh, vị trí chân). Rồi:
-            - ứng viên nảy ở NỬA SÂN CỦA CHÍNH NGƯỜI VỪA ĐÁNH, trong HIT_SIDE_EXCL_S sau cú đánh
-              -> loại (cú đánh gần như luôn sang sân đối thủ)
-    Ngưỡng px tính ở bề rộng 1920 và tự scale theo độ phân giải video.
+      L1  Within racket reach, higher than the feet: wrist keypoints / trajectory decide (as before).
+      L2  Hit log (hit events): whenever a wrist moves fast near the ball (or L1 concludes a hit)
+          record (frame, hitter's half, foot position). Then:
+            - a candidate that bounces ON THE HALF OF THE PERSON WHO JUST HIT, within HIT_SIDE_EXCL_S after the hit
+              -> rejected (a hit almost always goes to the opponent's side)
+    Pixel thresholds are expressed at width 1920 and scale automatically with the video resolution.
     """
 
     def __init__(self, fps, frame_width):
@@ -55,21 +55,21 @@ class BounceDetector:
         self.frame_idx = 0
         self._last_bounce = -10 ** 9
         self.samples = deque(maxlen=2 * self.half + 1)   # (frame_idx, pt, proj, players, feet)
-        self.marks = []                                  # [(frame_idx, x, y)] toạ độ mini-map
+        self.marks = []                                  # [(frame_idx, x, y)] mini-map coordinates
         self.swing = SwingDetector(fps)
 
-        self.shown = {}            # half -> frame_idx lần báo HIT gần nhất (để hiển thị)
-        self.hits = []             # [[frame_đầu, half người đánh, chân (mini-map) hoặc None, frame_cuối]]
+        self.shown = {}            # half -> frame_idx of the most recent HIT report (for display)
+        self.hits = []             # [[first frame, hitter's half, feet (mini-map) or None, last frame]]
 
     def reset(self):
-        """Chuyển cảnh: bỏ quỹ đạo, điểm nảy và sổ cú đánh cũ."""
+        """Scene change: drop the old trajectory, bounce points and hit log."""
         self.samples.clear()
         self.marks.clear()
         self.swing.reset()
         self.hits.clear()
         self.shown.clear()
 
-    # ------------------------------------------------------------------ sổ cú đánh
+    # ------------------------------------------------------------------ hit log
 
     @staticmethod
     def _project_feet(H, players):
@@ -84,7 +84,7 @@ class BounceDetector:
         return feet
 
     def _register_hit(self, frame, half, feet):
-        """Ghi 1 cú đánh (từ cổ tay, quỹ đạo hoặc suy luận). Tín hiệu trùng cú cũ thì gộp lại."""
+        """Record a hit (from the wrist, the trajectory or inference). A signal overlapping an older hit is merged into it."""
 
         xy = feet.get(half)
         self.shown[half] = self.frame_idx
@@ -103,25 +103,25 @@ class BounceDetector:
         self.hits = [h for h in self.hits if frame - h[3] <= self.hit_keep]
 
         if DEBUG_MODE:
-            print(f"[Hit] frame {frame}: {half} đánh bóng")
+            print(f"[Hit] frame {frame}: {half} hits the ball")
 
     def recent_hit_halves(self):
-        """Tập half đang trong thời gian hiển thị HIT (từ cổ tay HOẶC quỹ đạo bóng)."""
+        """Set of halves currently within the HIT display time (from the wrist OR the ball trajectory)."""
 
         self.shown = {h: f for h, f in self.shown.items() if self.frame_idx - f <= self.show_frames}
 
         return set(self.shown)
 
-    # ---- phát hiện cú đánh từ quỹ đạo ----
+    # ---- hit detection from the trajectory ----
 
     @staticmethod
     def _vel(frames, pts, a, b):
-        """Vận tốc (px/frame) của các mẫu a..b: độ dốc hồi quy tuyến tính theo frame."""
+        """Velocity (px/frame) of samples a..b: slope of a linear regression over the frames."""
         return np.array([np.polyfit(frames[a:b + 1], pts[a:b + 1, k], 1)[0] for k in (0, 1)])
 
     @staticmethod
     def _player_of(players, half):
-        """(cx, cy, h, y2) của player ở half, hoặc None."""
+        """(cx, cy, h, y2) of the player in `half`, or None."""
         for p in players:
             if p["half"] == half:
                 x1, y1, x2, y2 = p["box"]
@@ -130,7 +130,7 @@ class BounceDetector:
 
     @staticmethod
     def _reach_half(pt, players):
-        """Half của player gần nhất mà bóng đang trong tầm vợt (không đòi bóng cao hơn chân)."""
+        """Half of the nearest player whose racket reach contains the ball (the ball need not be above the feet)."""
 
         bx, by = float(pt[0]), float(pt[1])
         best, best_d = None, 1e18
@@ -150,9 +150,9 @@ class BounceDetector:
 
     def _trajectory_hit(self, fb, pb, frames, pts, players_seq, feet_b):
         """
-        Cú đánh từ quỹ đạo: bóng trong tầm vợt, hướng đi quay ngược lại (>= HIT_TRAJ_TURN_DEG),
-        tiến sát rồi rời xa player, và không mất tốc (bóng nảy mới mất tốc). Cổ tay đã khẳng
-        định "chậm, không vung" (swing_state False) thì bỏ qua.
+        Hit from the trajectory: ball within racket reach, direction reverses (>= HIT_TRAJ_TURN_DEG),
+        approaches then leaves the player, and does not lose speed (a bounce loses speed). If the wrist
+        has already confirmed "slow, no swing" (swing_state False), skip.
         """
 
         if not HIT_TRAJ_ENABLE:
@@ -167,7 +167,7 @@ class BounceDetector:
             return
 
         if float(v_in @ v_out) / (s_in * s_out) > np.cos(np.radians(HIT_TRAJ_TURN_DEG)):
-            return   # chưa quay ngược đủ lớn
+            return   # has not reversed enough
 
         players_b = players_seq[c]
         half = self._reach_half(pb, players_b)
@@ -181,9 +181,9 @@ class BounceDetector:
         need = HIT_TRAJ_GROUND_RATIO if on_ground else HIT_TRAJ_SPEED_RATIO
 
         if s_out / s_in < need:
-            return   # mất tốc: giống nảy hơn là đánh
+            return   # lost speed: looks more like a bounce than a hit
 
-        # Tiến sát rồi rời xa chính player đó
+        # Approaches then leaves that same player
         p0 = self._player_of(players_seq[0], half)
         p1 = self._player_of(players_seq[-1], half)
 
@@ -199,33 +199,33 @@ class BounceDetector:
             return
 
         if DEBUG_MODE:
-            print(f"[Hit] frame {fb}: quỹ đạo quay ngược ({half}), tốc độ sau/trước = {s_out / s_in:.2f}")
+            print(f"[Hit] frame {fb}: trajectory reversal ({half}), speed after/before = {s_out / s_in:.2f}")
 
         self._register_hit(fb, half, feet_b)
 
     def _hit_context_reject(self, fb, half_b):
-        """Trả về lý do loại (str) nếu ứng viên nảy thực ra là hệ quả của 1 cú đánh, ngược lại None."""
+        """Returns the rejection reason (str) if the bounce candidate is actually a consequence of a hit, otherwise None."""
 
-        # L2: theo sổ cú đánh (chỉ loại theo nửa sân; luật "sát chân" đã bỏ vì chồng với luật này)
+        # L2: according to the hit log (rejects only by court half; the "near the feet" rule was removed because it overlaps with this one)
         for first, half, _, _ in self.hits:
             dt = fb - first
 
             if dt < -self.hit_after_tol:
-                continue   # cú đánh xảy ra SAU lần nảy này (nảy rồi mới đánh): không liên quan
+                continue   # the hit happens AFTER this bounce (bounce first, then hit): unrelated
 
             if dt <= self.hit_side_excl and half == half_b:
-                return f"nảy ở nửa sân của {half} ngay sau cú đánh của người đó"
+                return f"bounce on {half}'s half right after that person's hit"
 
         return None
 
     # ------------------------------------------------------------------ update
 
     def update(self, ball_point, players, H):
-        """Gọi mỗi frame. Returns (x, y) điểm nảy vừa phát hiện (toạ độ mini-map) hoặc None."""
+        """Call every frame. Returns (x, y) of the newly detected bounce point (mini-map coordinates) or None."""
 
         self.frame_idx += 1
 
-        self.swing.update(self.frame_idx, players)   # ghi nhận cổ tay mỗi frame, trước các return sớm
+        self.swing.update(self.frame_idx, players)   # record wrists every frame, before the early returns
 
         if ball_point is None or H is None:
             return None
@@ -237,14 +237,14 @@ class BounceDetector:
 
         feet = self._project_feet(H, players)
 
-        # Cổ tay vung nhanh sát bóng ở frame hiện tại -> ghi nhận cú đánh (không phụ thuộc quỹ đạo)
+        # Wrist swinging fast near the ball at the current frame -> record a hit (independent of the trajectory)
         hitter = self.swing.swing_hitter(self.frame_idx, ball_point)
 
         if hitter is not None:
             self._register_hit(self.frame_idx, hitter, feet)
 
         if self.samples and self.frame_idx - self.samples[-1][0] > self.max_gap:
-            self.samples.clear()   # mất bóng quá lâu: quỹ đạo cũ không còn liên tục
+            self.samples.clear()   # ball lost for too long: the old trajectory is no longer continuous
 
         self.samples.append(
             (self.frame_idx, np.array(ball_point, dtype=np.float32), proj, players, feet))
@@ -259,16 +259,16 @@ class BounceDetector:
 
         fb, pb, proj_b, players_b, feet_b = self.samples[c]
 
-        # Cú đánh từ quỹ đạo: chạy mỗi frame, độc lập với việc có ứng viên nảy hay không
+        # Hit from the trajectory: runs every frame, independent of whether there is a bounce candidate
         self._trajectory_hit(fb, pb, frames, pts, [s[3] for s in self.samples], feet_b)
 
         min_drop = BOUNCE_MIN_DROP_PX * self.scale
 
-        # Đường 1: mẫu giữa là đáy quỹ đạo (y ảnh lớn nhất) của cả cửa sổ
+        # Path 1: the middle sample is the trajectory bottom (largest image y) of the whole window
         is_bottom = (int(np.argmax(ys)) == c
                      and ys[c] - ys[0] >= min_drop and ys[c] - ys[-1] >= min_drop)
 
-        # Đường 2: vy giảm đột ngột dù y ảnh không đổi chiều
+        # Path 2: vy drops abruptly even though image y does not reverse
         if not is_bottom and not self._is_impulse(frames, ys):
             return None
 
@@ -278,13 +278,13 @@ class BounceDetector:
         v_in = (pb - pts[0]) / (fb - frames[0])
         v_out = (pts[-1] - pb) / (frames[-1] - fb)
 
-        # L1: bóng trong tầm vợt VÀ cao hơn chân
+        # L1: ball within racket reach AND higher than the feet
         if self._in_racket_reach(pb, players_b):
             swing = self.swing.swing_state(fb, pb)
             hit_like = self._hit_like(v_in, v_out)
 
             if DEBUG_MODE:
-                print(f"[Bounce] frame {fb}: trong tầm vợt, swing={swing}, hit_like={hit_like}")
+                print(f"[Bounce] frame {fb}: within racket reach, swing={swing}, hit_like={hit_like}")
 
             if swing is True or (swing is None and hit_like):
                 half_hit = self._reach_half(pb, players_b)
@@ -292,12 +292,12 @@ class BounceDetector:
                 if half_hit is not None:
                     self._register_hit(fb, half_hit, feet_b)
 
-                return self._reject("cú đánh trong tầm vợt", fb)
+                return self._reject("hit within racket reach", fb)
 
         x, y = proj_b
         half_b = _half_of(y)
 
-        # L2: ngữ cảnh cú đánh
+        # L2: hit context
         reason = self._hit_context_reject(fb, half_b)
 
         if reason is not None:
@@ -305,24 +305,24 @@ class BounceDetector:
 
         if not (-BOUNCE_MAX_OUTSIDE_PX <= x <= MINI_COURT_W + BOUNCE_MAX_OUTSIDE_PX
                 and -BOUNCE_MAX_OUTSIDE_PX <= y <= MINI_COURT_H + BOUNCE_MAX_OUTSIDE_PX):
-            return self._reject("rơi quá xa sân", fb)
+            return self._reject("landed too far from the court", fb)
 
         self._last_bounce = fb
         self.marks.append((fb, float(x), float(y)))
 
         if DEBUG_MODE:
-            print(f"[Bounce] frame {fb}: mini-map ({x:.0f}, {y:.0f}) nửa sân {half_b}")
+            print(f"[Bounce] frame {fb}: mini-map ({x:.0f}, {y:.0f}) half {half_b}")
 
         return float(x), float(y)
 
-    # ------------------------------------------------------------------ tiện ích
+    # ------------------------------------------------------------------ utilities
 
     @staticmethod
     def _slope(frames, ys, a, b):
         return float(np.polyfit(frames[a:b + 1], ys[a:b + 1], 1)[0])
 
     def _is_impulse(self, frames, ys):
-        """Bóng đang đi xuống rồi vy giảm đột ngột (kể cả khi y ảnh không đổi chiều)."""
+        """The ball is moving down and then vy drops abruptly (even if image y does not reverse)."""
         c = self.half
         m = min(3, self.half - 1)
 
@@ -337,23 +337,23 @@ class BounceDetector:
         vals = [dvy(i) for i in (c - 1, c, c + 1)]
         d, vin = vals[1]
 
-        # Nảy = vy bị giật ngược lên (d rất âm). KHÔNG đòi vin > 0: bóng nảy xiên bay ra xa camera
-        # đang đi lên trong ảnh (vin <= 0) trước khi nảy, y ảnh không có "đáy".
+        # Bounce = vy is jerked upward (d very negative). Do NOT require vin > 0: a ball bouncing obliquely away
+        # from the camera is moving up in the image (vin <= 0) before the bounce, so image y has no "bottom".
         if d > -BOUNCE_MIN_DVY_PX * self.scale:
             return False
 
         if DEBUG_MODE:
-            print(f"[Bounce] xung vy: vin={vin:.1f} d={d:.1f}")
+            print(f"[Bounce] vy impulse: vin={vin:.1f} d={d:.1f}")
 
         return d <= min(v[0] for v in vals)
 
     def _reject(self, reason, frame):
         if DEBUG_MODE:
-            print(f"[Bounce] frame {frame}: bỏ ({reason})")
+            print(f"[Bounce] frame {frame}: rejected ({reason})")
         return None
 
     def _hit_like(self, v_in, v_out):
-        """Cú đánh: bóng tăng tốc rõ rệt hoặc đảo chiều ngang."""
+        """A hit: the ball clearly speeds up or reverses horizontally."""
 
         speed_in = float(np.hypot(*v_in))
         speed_out = float(np.hypot(*v_out))
@@ -365,11 +365,11 @@ class BounceDetector:
         return v_in[0] * v_out[0] < 0 and abs(v_in[0]) > vx_min and abs(v_out[0]) > vx_min
 
     def recent_swings(self):
-        """List (half, toạ độ cổ tay, box) các cú vung vợt còn trong thời gian hiển thị."""
+        """List of (half, wrist coordinates, box) for swings still within the display time."""
         return self.swing.recent_swings(self.frame_idx)
 
     def recent_marks(self):
-        """List (x, y) các điểm nảy còn trong thời gian hiển thị (toạ độ mini-map)."""
+        """List of (x, y) bounce points still within the display time (mini-map coordinates)."""
 
         self.marks = [m for m in self.marks if self.frame_idx - m[0] <= self.mark_frames]
 
@@ -377,7 +377,7 @@ class BounceDetector:
 
     @staticmethod
     def _in_racket_reach(pt, players):
-        """True nếu bóng đang trong tầm vợt của 1 player và cao hơn chân quá BALL_AIR_MIN_RAISE."""
+        """True if the ball is within a player's racket reach and higher than the feet by more than BALL_AIR_MIN_RAISE."""
 
         bx, by = float(pt[0]), float(pt[1])
 

@@ -1,4 +1,4 @@
-"""Court tracker: optical flow mỗi frame + detect lại (KeypointRCNN) chạy nền khi cần."""
+"""Court tracker: optical flow every frame + background re-detection (KeypointRCNN) when needed."""
 
 import threading
 
@@ -34,15 +34,15 @@ def _box_from_keypoints(kp):
 
 def track_court_by_optical_flow(ref_gray, gray, keypoints):
     """
-    Lucas-Kanade optical flow cho 14 keypoint từ ảnh tham chiếu `ref_gray` (frame mà
-    keypoints đang khớp) tới frame hiện tại. Ảnh xám đã thu nhỏ theo OPTICAL_FLOW_SCALE;
-    toạ độ trả về ở hệ full-res.
+    Lucas-Kanade optical flow for the 14 keypoints from the reference image `ref_gray` (the frame the
+    keypoints currently match) to the current frame. Grayscale images are downscaled by OPTICAL_FLOW_SCALE;
+    returned coordinates are in the full-resolution system.
 
     Returns:
-        None nếu mất track, ngược lại (new_keypoints, M, motion, fit_ok)
-        M      = affine 2x3 (full-res) mô tả chuyển động camera
-        motion = độ dịch trung bình (px) của 14 keypoint
-        fit_ok = False nếu phép biến đổi khớp kém (zoom / đổi góc / nhiều điểm lệch)
+        None if tracking is lost, otherwise (new_keypoints, M, motion, fit_ok)
+        M      = affine 2x3 (full-res) describing the camera motion
+        motion = mean displacement (px) of the 14 keypoints
+        fit_ok = False if the transform fits poorly (zoom / angle change / many outlier points)
     """
 
     xy = keypoints[:, :2].astype(np.float32)
@@ -69,7 +69,7 @@ def track_court_by_optical_flow(ref_gray, gray, keypoints):
     fit_ok = (inliers.mean() >= COURT_FLOW_MIN_INLIER_RATIO
               and residual <= COURT_FLOW_MAX_RESIDUAL_PX)
 
-    # Áp phép biến đổi camera chung lên TOÀN BỘ 14 keypoint
+    # Apply the shared camera transform to ALL 14 keypoints
     warped = _warp_points(M, xy)
     updated = keypoints.copy()
     updated[:, :2] = warped
@@ -83,8 +83,8 @@ _COURT_STREAM = None
 
 
 def _get_court_stream():
-    """Dùng lại 1 CUDA stream cho mọi job (tạo stream mới mỗi lần làm allocator của
-    PyTorch không tái sử dụng được vùng nhớ -> cudaMalloc/cudaFree lặp lại gây đứng hình)."""
+    """Reuse a single CUDA stream for every job (creating a new stream each time prevents PyTorch's
+    allocator from reusing memory -> repeated cudaMalloc/cudaFree causes stutter)."""
     global _COURT_STREAM
     if _COURT_STREAM is None:
         _COURT_STREAM = torch.cuda.Stream(device=DEVICE)
@@ -93,10 +93,10 @@ def _get_court_stream():
 
 class _DetectJob:
     """
-    Chạy detect_court trên thread nền (CUDA stream riêng) để main loop không khựng.
+    Run detect_court on a background thread (own CUDA stream) so the main loop does not stall.
 
-    `acc` là phép biến đổi camera TÍCH LŨY từ frame lúc submit tới frame hiện tại,
-    dùng để đưa kết quả (ở hệ toạ độ frame cũ) về frame hiện tại.
+    `acc` is the ACCUMULATED camera transform from the frame at submit time to the current frame,
+    used to bring the result (in the old frame's coordinates) to the current frame.
     """
 
     def __init__(self, court_model, frame):
@@ -123,14 +123,14 @@ class _DetectJob:
 
 class CourtTracker:
     """
-    - Mỗi frame: optical flow (so với ảnh tham chiếu) bù chuyển động camera. Camera gần
-      như đứng yên thì giữ nguyên sân + ảnh tham chiếu, nên không tích nhiễu và H ổn định.
-    - Detect lại (KeypointRCNN, chạy NỀN) CHỈ khi cần, xem `_redetect_reason`:
-        poor-fit      optical flow khớp kém (zoom / đổi góc / điểm lệch nhiều)
-        camera-moved  keypoint đã trôi theo camera đủ xa kể từ lần detect cuối
-        max-interval  lâu quá không detect (chốt chặn an toàn)
-      Luôn cách nhau tối thiểu COURT_MIN_INTERVAL frame.
-    - Chưa có sân / mất track: detect ĐỒNG BỘ ngay.
+    - Every frame: optical flow (against the reference image) compensates camera motion. When the camera is
+      almost still, the court + reference image are kept as is, so noise does not accumulate and H stays stable.
+    - Re-detection (KeypointRCNN, running in the BACKGROUND) ONLY when needed, see `_redetect_reason`:
+        poor-fit      optical flow fits poorly (zoom / angle change / many outlier points)
+        camera-moved  keypoints drifted with the camera far enough since the last detection
+        max-interval  too long since the last detection (safety stop)
+      Always at least COURT_MIN_INTERVAL frames apart.
+    - No court yet / track lost: detect SYNCHRONOUSLY right away.
     """
 
     def __init__(self, court_model):
@@ -138,15 +138,15 @@ class CourtTracker:
         self.frame_idx = 0
 
         self.cached_court = None   # (box, keypoints, score)
-        self.cached_H = None       # homography ứng với cached_court
-        self.ref_gray = None       # ảnh xám (đã thu nhỏ) mà cached keypoints đang khớp
+        self.cached_H = None       # homography matching cached_court
+        self.ref_gray = None       # (downscaled) grayscale image the cached keypoints currently match
 
-        self.last_detect_idx = -COURT_LOST_RETRY_INTERVAL   # frame_idx của lần detect gần nhất
-        self.travel = 0.0          # tổng quãng đường keypoint trôi kể từ lần detect gần nhất
-        self.poor_fit = False      # optical flow khớp kém kể từ lần detect gần nhất
+        self.last_detect_idx = -COURT_LOST_RETRY_INTERVAL   # frame_idx of the most recent detection
+        self.travel = 0.0          # total distance keypoints drifted since the most recent detection
+        self.poor_fit = False      # optical flow fit poorly since the most recent detection
 
         self._job = None
-        self.sync_fail = 0         # số lần detect đồng bộ thất bại liên tiếp
+        self.sync_fail = 0         # number of consecutive synchronous detection failures
 
     def _set_court(self, box, keypoints, score):
         self.cached_court = (box, keypoints, score)
@@ -171,7 +171,7 @@ class CourtTracker:
         return ""
 
     def _drop_job(self):
-        """Đợi job nền (nếu có) chạy xong rồi bỏ kết quả."""
+        """Wait for the background job (if any) to finish, then discard its result."""
         if self._job is not None:
             self._job.done.wait()
             self._job = None
@@ -185,7 +185,7 @@ class CourtTracker:
         self._job = None
 
         if job.error is not None:
-            print(f"[Court] detect nền bị lỗi: {job.error}")
+            print(f"[Court] background detection failed: {job.error}")
             return
 
         if job.result is None:
@@ -193,19 +193,19 @@ class CourtTracker:
 
         _, kp, score = job.result
 
-        # Kết quả ở hệ toạ độ frame lúc submit -> bù chuyển động camera tích luỹ
+        # Result is in the coordinates of the frame at submit time -> compensate accumulated camera motion
         kp = kp.copy()
         kp[:, :2] = _warp_points(job.acc, kp[:, :2])
 
-        if DEBUG_MODE:   # độ lệch giữa sân đang track và sân detect lại: dùng để chỉnh ngưỡng
+        if DEBUG_MODE:   # gap between the tracked court and the re-detected court: used to tune thresholds
             gap = np.linalg.norm(kp[:, :2] - self.cached_court[1][:, :2], axis=1).mean()
-            print(f"[Court] frame {self.frame_idx}: lệch so với optical flow {gap:.2f}px")
+            print(f"[Court] frame {self.frame_idx}: offset vs optical flow {gap:.2f}px")
 
         self._set_court(_box_from_keypoints(kp), kp, score)
 
     def update(self, frame, gray=None):
-        """Cập nhật sân cho frame hiện tại. Returns (cached_court, cached_H).
-        gray: ảnh xám đã thu nhỏ theo OPTICAL_FLOW_SCALE (tính sẵn ở thread đọc); None thì tự tính."""
+        """Update the court for the current frame. Returns (cached_court, cached_H).
+        gray: grayscale image already downscaled by OPTICAL_FLOW_SCALE (precomputed in the reader thread); computed here if None."""
 
         self.frame_idx += 1
 
@@ -222,17 +222,17 @@ class CourtTracker:
 
         if need_sync and self.frame_idx - self.last_detect_idx < COURT_LOST_RETRY_INTERVAL:
             self.ref_gray = gray
-            return None, None   # chưa có sân (cảnh không phải sân): không detect mỗi frame
+            return None, None   # no court yet (non-court scene): do not detect every frame
 
         if not need_sync:
             tracked = track_court_by_optical_flow(self.ref_gray, gray, self.cached_court[1])
 
             if tracked is None:
-                need_sync = True   # mất track (cắt cảnh...) -> detect lại ngay
+                need_sync = True   # track lost (scene cut...) -> re-detect immediately
             else:
                 tracked_kp, M, motion, fit_ok = tracked
 
-                # Camera đứng yên (dịch < deadband): giữ nguyên sân và ảnh tham chiếu
+                # Still camera (shift < deadband): keep the court and reference image as is
                 if motion >= COURT_FLOW_DEADBAND_PX:
                     self._set_court(
                         _box_from_keypoints(tracked_kp), tracked_kp, self.cached_court[2]
@@ -241,7 +241,7 @@ class CourtTracker:
                     self.travel += motion
                     self.poor_fit = self.poor_fit or not fit_ok
 
-                    # Cộng dồn chuyển động camera cho job nền đang chạy
+                    # Accumulate camera motion for the running background job
                     if self._job is not None:
                         self._job.acc = _affine_to_3x3(M) @ self._job.acc
 
@@ -254,8 +254,8 @@ class CourtTracker:
                 self._set_court(*result)
                 self.sync_fail = 0
             else:
-                # Detect thất bại (độ tin cậy quá thấp / không thấy sân): đủ N lần thì bỏ sân cũ
-                # thay vì giữ mãi sân của cảnh trước
+                # Detection failed (confidence too low / no court seen): after N failures drop the old court
+                # instead of keeping the previous scene's court forever
                 self.sync_fail += 1
 
                 if self.sync_fail >= COURT_DROP_AFTER_FAILS:
@@ -265,21 +265,21 @@ class CourtTracker:
             self.ref_gray = gray
             self._mark_detect()
         else:
-            # Nhận kết quả detect nền (nếu đã xong), rồi mới quyết định submit job mới
+            # Collect the background detection result (if finished), then decide whether to submit a new job
             self._finish_job_if_ready()
 
             reason = self._redetect_reason()
 
             if reason and self._job is None:
                 if DEBUG_MODE:
-                    print(f"[Court] frame {self.frame_idx}: detect lại ({reason})")
+                    print(f"[Court] frame {self.frame_idx}: re-detecting ({reason})")
                 self._job = _DetectJob(self.court_model, frame)
                 self._mark_detect()
 
         return self.cached_court, self.cached_H
 
     def reset(self):
-        """Chuyển cảnh: bỏ sân cũ, detect lại từ đầu (nếu cảnh mới không có sân thì court = None)."""
+        """Scene change: drop the old court and detect from scratch (if the new scene has no court, court = None)."""
         self._drop_job()
         self.cached_court = None
         self.cached_H = None
